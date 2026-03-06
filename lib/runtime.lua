@@ -4,10 +4,17 @@
 local util = require "util"
 local tabutil = require "tabutil"
 
+local MOD_NAME = "nagatomo"
+local OSC_PATHS = {
+  connection = "/toga_connection",
+  grid_prefix = "/togagrid/",
+  arc_prefix = "/togaarc/",
+}
+
 local runtime = {
-  data_dir = tostring(_path.data) .. "toga-shim/",
-  prefs_fn = tostring(_path.data) .. "toga-shim/prefs.lua",
-  clients_fn = tostring(_path.data) .. "toga-shim/clients.lua",
+  data_dir = tostring(_path.data) .. MOD_NAME .. "/",
+  prefs_fn = tostring(_path.data) .. MOD_NAME .. "/prefs.lua",
+  clients_fn = tostring(_path.data) .. MOD_NAME .. "/clients.lua",
   client_timeout_s = 20,
 }
 
@@ -489,17 +496,17 @@ local function send_osc(client, path, args)
 end
 
 local function send_connected(client, connected)
-  send_osc(client, "/toga_connection", { connected and 1.0 or 0.0 })
+  send_osc(client, OSC_PATHS.connection, { connected and 1.0 or 0.0 })
 end
 
 local function send_grid_led(client, x, y, level)
   local index = x + (y - 1) * GRID_COLS
-  send_osc(client, string.format("/togagrid/%d", index), { level / 15.0 })
+  send_osc(client, string.format("%s%d", OSC_PATHS.grid_prefix, index), { level / 15.0 })
 end
 
 local function send_arc_led(client, ring, led, level)
   for group = 1, 2 do
-    send_osc(client, string.format("/togaarc/knob%d/group%d/button%d", ring, group, led), { level / 15.0 })
+    send_osc(client, string.format("%sknob%d/group%d/button%d", OSC_PATHS.arc_prefix, ring, group, led), { level / 15.0 })
   end
 end
 
@@ -572,7 +579,7 @@ local function reconnect_known_clients()
       send_arc_state(true, client)
     end
   end
-  print("[toga-shim] reconnect requested for known clients")
+  print("[nagatomo] reconnect requested for known clients")
 end
 
 local function age_string(timestamp)
@@ -625,7 +632,7 @@ local function cycle_policy(kind)
   save_prefs()
   runtime.refresh_ports()
   runtime.resend_state(nil, false)
-  print(string.format("[toga-shim] %s policy -> %s", kind, POLICY_LABELS[runtime.prefs[kind]]))
+  print(string.format("[nagatomo] %s policy -> %s", kind, POLICY_LABELS[runtime.prefs[kind]]))
 end
 
 function runtime.cycle_grid_policy()
@@ -644,7 +651,7 @@ function runtime.clear_active_clients()
   for _, client in pairs(runtime.clients) do
     client.active = false
   end
-  print("[toga-shim] cleared active client sessions")
+  print("[nagatomo] cleared active client sessions")
   mark_dirty()
 end
 
@@ -652,7 +659,7 @@ function runtime.forget_client_history()
   runtime.clients = {}
   runtime.client_order = {}
   save_clients()
-  print("[toga-shim] forgot client history")
+  print("[nagatomo] forgot client history")
   mark_dirty()
 end
 
@@ -795,7 +802,6 @@ function runtime.arc_intensity(port, value)
 end
 
 function runtime.grid_cleanup()
-  core.grid.cleanup()
   runtime.grid_api.add = default_grid_add
   runtime.grid_api.remove = function() end
   for port = 1, GRID_PORTS do
@@ -804,14 +810,18 @@ function runtime.grid_cleanup()
     vport.tilt = nil
     vport.remove = nil
   end
+  core.grid.cleanup()
   reset_grid_buffers(0)
-  send_grid_state(true)
+  if active_client_count() > 0 and grid_touchosc_enabled(1) then
+    send_grid_state(true)
+  end
   runtime.refresh_ports()
-  mark_dirty()
+  if _menu and _menu.mode and _menu.page == "MODS" then
+    mark_dirty()
+  end
 end
 
 function runtime.arc_cleanup()
-  core.arc.cleanup()
   runtime.arc_api.add = default_arc_add
   runtime.arc_api.remove = function() end
   for port = 1, ARC_PORTS do
@@ -820,14 +830,19 @@ function runtime.arc_cleanup()
     vport.delta = nil
     vport.remove = nil
   end
+  core.arc.cleanup()
   reset_arc_buffers(0)
-  send_arc_state(true)
+  if active_client_count() > 0 and arc_touchosc_enabled(1) then
+    send_arc_state(true)
+  end
   runtime.refresh_ports()
-  mark_dirty()
+  if _menu and _menu.mode and _menu.page == "MODS" then
+    mark_dirty()
+  end
 end
 
 local function handle_grid_press(client, args, path)
-  local index = tonumber(path:match("^/togagrid/(%d+)$"))
+  local index = tonumber(path:match("^" .. OSC_PATHS.grid_prefix .. "(%d+)$"))
   if index == nil then
     return false
   end
@@ -863,7 +878,7 @@ local function arc_delta_for_client(client, ring, position)
 end
 
 local function handle_arc_message(client, args, path)
-  local ring, suffix = path:match("^/togaarc/knob(%d+)(/[%w_]+)$")
+  local ring, suffix = path:match("^" .. OSC_PATHS.arc_prefix .. "knob(%d+)(/[%w_]+)$")
   if ring == nil or suffix == nil then
     return false
   end
@@ -904,7 +919,7 @@ local function handle_connection(client, args)
   send_connected(client, true)
   send_grid_state(true, client)
   send_arc_state(true, client)
-  print(string.format("[toga-shim] client connected: %s:%s", client.host, tostring(client.port)))
+  print(string.format("[nagatomo] client connected: %s:%s", client.host, tostring(client.port)))
   return true
 end
 
@@ -913,14 +928,23 @@ local function handle_touchosc(path, args, from)
     return false
   end
 
-  if not util.string_starts(path, "/toga") then
+  if type(path) ~= "string" then
+    return false
+  end
+
+  local is_touchosc_message =
+    path == OSC_PATHS.connection or
+    util.string_starts(path, OSC_PATHS.grid_prefix) or
+    util.string_starts(path, OSC_PATHS.arc_prefix)
+
+  if not is_touchosc_message then
     return false
   end
 
   local capability = "connection"
-  if util.string_starts(path, "/togagrid/") then
+  if util.string_starts(path, OSC_PATHS.grid_prefix) then
     capability = "grid"
-  elseif util.string_starts(path, "/togaarc/") then
+  elseif util.string_starts(path, OSC_PATHS.arc_prefix) then
     capability = "arc"
   end
 
@@ -931,11 +955,11 @@ local function handle_touchosc(path, args, from)
     end
   end
 
-  if path == "/toga_connection" then
+  if path == OSC_PATHS.connection then
     return handle_connection(client, args or {})
   end
 
-  if util.string_starts(path, "/togagrid/") then
+  if util.string_starts(path, OSC_PATHS.grid_prefix) then
     if created or reactivated then
       send_connected(client, true)
       send_grid_state(true, client)
@@ -944,7 +968,7 @@ local function handle_touchosc(path, args, from)
     return handle_grid_press(client, args or {}, path)
   end
 
-  if util.string_starts(path, "/togaarc/") then
+  if util.string_starts(path, OSC_PATHS.arc_prefix) then
     if created or reactivated then
       send_connected(client, true)
       send_grid_state(true, client)
@@ -1098,7 +1122,7 @@ function runtime.run_light_test()
     core.arc.vports[1]:refresh()
   end
 
-  print("[toga-shim] light test sent; use 'Resend state' to restore the current script state")
+  print("[nagatomo] light test sent; use 'Resend state' to restore the current script state")
 end
 
 runtime.grid_api = {
@@ -1241,7 +1265,7 @@ function runtime.install()
   package.loaded["arc"] = runtime.arc_api
 
   runtime.installed = true
-  print("[toga-shim] installed runtime")
+  print("[nagatomo] installed runtime")
   return runtime
 end
 

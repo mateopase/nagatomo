@@ -21,7 +21,7 @@ if runtime == nil then
   end
 
   if runtime == nil then
-    error("unable to load toga-shim runtime")
+    error("unable to load nagatomo runtime")
   end
   package.loaded[runtime_key] = runtime
 end

@@ -1,4 +1,4 @@
-# TOGA-SHIM for Norns
+# nagatomo for norns
 
 This repo is an installable norns mod. It exposes TouchOSC as a virtual `grid` and `arc` device layer while keeping compatibility with the existing `toga.tosc` layout.
 
