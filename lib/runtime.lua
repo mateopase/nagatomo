@@ -162,6 +162,10 @@ local function decode_capabilities(encoded)
 end
 
 local function client_is_active(client)
+  return client ~= nil and client.active == true
+end
+
+local function client_is_fresh(client)
   if not client or not client.active then
     return false
   end
@@ -590,7 +594,7 @@ local function age_string(timestamp)
 end
 
 function runtime.describe_client(client)
-  local state = client_is_active(client) and "active" or "recent"
+  local state = client_is_active(client) and (client_is_fresh(client) and "active" or "idle") or "recent"
   return string.format("%s:%s %s %s", client.host, tostring(client.port), state, age_string(client.last_seen))
 end
 
@@ -892,11 +896,11 @@ end
 local function handle_connection(client, args)
   local requested = (tonumber(args[1]) or 1) > 0
   if not requested then
-    set_client_active(client, false)
-    print(string.format("[toga-shim] client disconnected: %s:%s", client.host, tostring(client.port)))
+    client.last_seen = now_s()
     return true
   end
 
+  set_client_active(client, true)
   send_connected(client, true)
   send_grid_state(true, client)
   send_arc_state(true, client)
@@ -1046,53 +1050,55 @@ function runtime.set_menu_redraw(func)
 end
 
 function runtime.run_light_test()
-  local grid_before = clone_buffer(runtime.grid_state.new)
-  local arc_before = clone_buffer(runtime.arc_state.new)
+  local clients = runtime.active_clients()
 
-  runtime.grid_all(1, 0)
-  for y = 1, GRID_ROWS do
-    for x = 1, GRID_COLS do
-      runtime.grid_led(1, x, y, ((x + y) % 2 == 0) and 12 or 3)
+  for _, client in ipairs(clients) do
+    send_connected(client, true)
+    for y = 1, GRID_ROWS do
+      for x = 1, GRID_COLS do
+        send_grid_led(client, x, y, ((x + y) % 2 == 0) and 12 or 3)
+      end
     end
   end
-  runtime.grid_refresh(1, true)
 
-  runtime.arc_all(1, 0)
+  if grid_physical_enabled(1) then
+    core.grid.vports[1]:all(0)
+    for y = 1, GRID_ROWS do
+      for x = 1, GRID_COLS do
+        core.grid.vports[1]:led(x, y, ((x + y) % 2 == 0) and 12 or 3)
+      end
+    end
+    core.grid.vports[1]:refresh()
+  end
+
   local quarter = math.pi * 0.5
-  for ring = 1, ARC_COLS do
-    runtime.arc_segment(1, ring, 0, quarter, 15)
+  local tau = math.pi * 2
+  local step = tau / ARC_ROWS
+  for _, client in ipairs(clients) do
+    for ring = 1, ARC_COLS do
+      for led = 1, ARC_ROWS do
+        local sa = step * (led - 1)
+        local sb = step * led
+        local lit = math.max(0, math.min(sb, quarter) - math.max(sa, 0)) > 0
+        send_arc_led(client, ring, led, lit and 15 or 0)
+      end
+    end
   end
-  runtime.arc_refresh(1, true)
 
-  clock.run(function()
-    clock.sleep(0.75)
-    runtime.grid_state.new = clone_buffer(grid_before)
-    runtime.arc_state.new = clone_buffer(arc_before)
-    send_grid_state(true)
-    send_arc_state(true)
-    if grid_physical_enabled(1) then
-      core.grid.vports[1]:all(0)
-      core.grid.vports[1]:refresh()
-      for y = 1, GRID_ROWS do
-        for x = 1, GRID_COLS do
-          core.grid.vports[1]:led(x, y, runtime.grid_state.new[x][y])
-        end
+  if arc_physical_enabled(1) then
+    core.arc.vports[1]:all(0)
+    for ring = 1, ARC_COLS do
+      for led = 1, ARC_ROWS do
+        local sa = step * (led - 1)
+        local sb = step * led
+        local lit = math.max(0, math.min(sb, quarter) - math.max(sa, 0)) > 0
+        core.arc.vports[1]:led(ring, led, lit and 15 or 0)
       end
-      core.grid.vports[1]:refresh()
     end
-    if arc_physical_enabled(1) then
-      core.arc.vports[1]:all(0)
-      core.arc.vports[1]:refresh()
-      for ring = 1, ARC_COLS do
-        for led = 1, ARC_ROWS do
-          core.arc.vports[1]:led(ring, led, runtime.arc_state.new[ring][led])
-        end
-      end
-      core.arc.vports[1]:refresh()
-    end
-  end)
+    core.arc.vports[1]:refresh()
+  end
 
-  print("[toga-shim] light test sent")
+  print("[toga-shim] light test sent; use 'Resend state' to restore the current script state")
 end
 
 runtime.grid_api = {

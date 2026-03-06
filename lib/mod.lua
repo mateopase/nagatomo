@@ -39,23 +39,23 @@ local function build_rows()
   local rows = {
     {
       kind = "action",
-      name = "Grid policy",
+      name = "grid policy",
       value = function()
-        return status.grid_policy
+        return string.lower(status.grid_policy)
       end,
       action = runtime.cycle_grid_policy,
     },
     {
       kind = "action",
-      name = "Arc policy",
+      name = "arc policy",
       value = function()
-        return status.arc_policy
+        return string.lower(status.arc_policy)
       end,
       action = runtime.cycle_arc_policy,
     },
     {
       kind = "info",
-      name = "Bindings",
+      name = "bindings",
       value = function()
         local parts = {}
         table.insert(parts, status.grid_bound and "grid" or "-")
@@ -65,7 +65,7 @@ local function build_rows()
     },
     {
       kind = "info",
-      name = "Script",
+      name = "script",
       value = function()
         return status.script_name or "none"
       end,
@@ -74,24 +74,22 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "section",
-    name = string.format("Active (%d)", status.total_active),
+    name = string.format("active (%d)", status.total_active),
   })
 
   if #status.active_clients == 0 then
     table.insert(rows, {
-      kind = "info",
-      name = "client",
-      value = function()
-        return "none"
+      kind = "detail",
+      text = function()
+        return "no active clients"
       end,
     })
   else
     for _, client in ipairs(status.active_clients) do
       local label = runtime.describe_client(client)
       table.insert(rows, {
-        kind = "info",
-        name = "client",
-        value = function()
+        kind = "detail",
+        text = function()
           return label
         end,
       })
@@ -100,24 +98,22 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "section",
-    name = "Recent",
+    name = "recent",
   })
 
   if #status.recent_clients == 0 then
     table.insert(rows, {
-      kind = "info",
-      name = "client",
-      value = function()
-        return "none"
+      kind = "detail",
+      text = function()
+        return "no recent clients"
       end,
     })
   else
     for _, client in ipairs(status.recent_clients) do
       local label = runtime.describe_client(client)
       table.insert(rows, {
-        kind = "info",
-        name = "client",
-        value = function()
+        kind = "detail",
+        text = function()
           return label
         end,
       })
@@ -126,12 +122,12 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "section",
-    name = "Actions",
+    name = "actions",
   })
 
   table.insert(rows, {
     kind = "action",
-    name = "Reconnect clients",
+    name = "reconnect clients",
     value = function()
       return ""
     end,
@@ -140,7 +136,7 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "action",
-    name = "Resend state",
+    name = "resend state",
     value = function()
       return ""
     end,
@@ -151,7 +147,7 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "action",
-    name = "Clear active",
+    name = "clear active",
     value = function()
       return ""
     end,
@@ -160,7 +156,7 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "action",
-    name = "Forget history",
+    name = "forget history",
     value = function()
       return ""
     end,
@@ -169,7 +165,7 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "action",
-    name = "Light test",
+    name = "light test",
     value = function()
       return ""
     end,
@@ -207,8 +203,12 @@ function menu.redraw()
 
   screen.clear()
   screen.level(15)
-  screen.move(64, 10)
-  screen.text_center("TOGA-SHIM")
+  screen.move(64, 9)
+  screen.text_center("nagatomo")
+  screen.level(3)
+  screen.move(8, 12)
+  screen.line(120, 12)
+  screen.stroke()
 
   local visible = 5
   local top = util.clamp(menu.index - 2, 1, math.max(1, #rows - (visible - 1)))
@@ -224,23 +224,27 @@ function menu.redraw()
     local selected = idx == menu.index
 
     if selected then
-      screen.level(4)
-      screen.move(6, y + 3)
-      screen.line(122, y + 3)
+      screen.level(3)
+      screen.move(8, y + 3)
+      screen.line(120, y + 3)
       screen.stroke()
     end
 
     if row.kind == "section" then
-      screen.level(selected and 15 or 10)
+      screen.level(selected and 14 or 6)
       screen.move(8, y)
-      screen.text(string.upper(row.name))
+      screen.text(row.name)
+    elseif row.kind == "detail" then
+      screen.level(selected and 15 or 8)
+      screen.move(10, y)
+      screen.text(clip(row.text and row.text() or "", 112))
     else
       screen.level(selected and 15 or 8)
       screen.move(10, y)
-      screen.text(clip(row.name, 44))
+      screen.text(clip(row.name, 58))
       local value = row.value and row.value() or ""
-      screen.move(122, y)
-      screen.text_right(clip(value, 72))
+      screen.move(120, y)
+      screen.text_right(clip(value, 50))
     end
   end
 
