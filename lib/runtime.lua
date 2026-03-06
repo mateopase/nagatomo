@@ -1183,6 +1183,11 @@ function runtime.grid_api.connect(port)
   return runtime.grid_vports[port or 1]
 end
 
+function runtime.grid_api.update_devices()
+  core.grid.update_devices()
+  runtime.refresh_ports()
+end
+
 function runtime.grid_api.cleanup()
   runtime.grid_cleanup()
 end
@@ -1190,6 +1195,11 @@ end
 function runtime.arc_api.connect(port)
   runtime.refresh_ports()
   return runtime.arc_vports[port or 1]
+end
+
+function runtime.arc_api.update_devices()
+  core.arc.update_devices()
+  runtime.refresh_ports()
 end
 
 function runtime.arc_api.cleanup()
@@ -1200,6 +1210,15 @@ function runtime.install()
   if runtime.installed then
     runtime.refresh_ports()
     return runtime
+  end
+
+  if norns and norns.script then
+    if norns.script.redraw == nil then
+      norns.script.redraw = norns.blank
+    end
+    if norns.script.refresh == nil then
+      norns.script.refresh = norns.none
+    end
   end
 
   load_prefs()
