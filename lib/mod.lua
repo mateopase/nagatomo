@@ -127,15 +127,6 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "action",
-    name = "reconnect clients",
-    value = function()
-      return ""
-    end,
-    action = runtime.reconnect_known_clients,
-  })
-
-  table.insert(rows, {
-    kind = "action",
     name = "resend state",
     value = function()
       return ""
@@ -147,16 +138,7 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "action",
-    name = "clear active",
-    value = function()
-      return ""
-    end,
-    action = runtime.clear_active_clients,
-  })
-
-  table.insert(rows, {
-    kind = "action",
-    name = "forget history",
+    name = "forget saved",
     value = function()
       return ""
     end,
@@ -263,10 +245,14 @@ function menu.redraw()
     else
       screen.level(selected and 15 or 8)
       screen.move(10, y)
-      screen.text(clip(row.name, 58))
       local value = row.value and row.value() or ""
-      screen.move(120, y)
-      screen.text_right(clip(value, 50))
+      if value == "" then
+        screen.text(clip(row.name, 112))
+      else
+        screen.text(clip(row.name, 58))
+        screen.move(120, y)
+        screen.text_right(clip(value, 50))
+      end
     end
   end
 
