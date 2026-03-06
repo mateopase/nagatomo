@@ -1,9 +1,0 @@
-[submodule "examples/toga"]
-	path = reference/toga
-	url = https://github.com/wangpy/toga
-[submodule "examples/toga-norns"]
-	path = reference/toga-norns
-	url = https://github.com/blindorange/toga-norns
-[submodule "reference/norns"]
-	path = reference/norns
-	url = https://github.com/monome/norns
