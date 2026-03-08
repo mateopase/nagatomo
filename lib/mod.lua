@@ -1,30 +1,7 @@
--- SPDX-FileCopyrightText: 2026 Mateo Paredes Sepulveda
--- SPDX-License-Identifier: GPL-3.0-or-later
-
 local mod = require "core/mods"
 local util = require "util"
 
-local runtime_key = mod.this_name .. ".runtime"
-local runtime = package.loaded[runtime_key]
-if runtime == nil then
-  local candidates = {}
-  if _path and _path.code and mod.this_name then
-    table.insert(candidates, _path.code .. mod.this_name .. "/lib/runtime.lua")
-  end
-  table.insert(candidates, "lib/runtime.lua")
-
-  for _, path in ipairs(candidates) do
-    if util.file_exists(path) then
-      runtime = dofile(path)
-      break
-    end
-  end
-
-  if runtime == nil then
-    error("unable to load nagatomo runtime")
-  end
-  package.loaded[runtime_key] = runtime
-end
+local runtime = require(mod.this_name .. "/lib/install")
 
 runtime.install()
 

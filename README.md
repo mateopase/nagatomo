@@ -72,14 +72,11 @@ The `retry writes` toggle controls whether `nagatomo` sends newly written LEDs o
 - `touchosc only`: use TouchOSC even if physical hardware is attached
 - `mirror both`: send output to both TouchOSC and physical hardware
 
-## notes and limitations
+## notes
 
-- the TouchOSC wire protocol still uses the `toga` OSC addresses
+- our TouchOSC wire protocol still uses the `toga` OSC addresses
 - TouchOSC Mk1 is not a supported target
 - the virtual TouchOSC devices are exposed on port `1` in norns
 - TouchOSC feedback still runs over UDP, so LED recovery is best-effort rather than acknowledged delivery
 
-## license
-
-- license: `GPL-3.0-or-later`
-- `assets/toga.tosc` is bundled from the original TOGA project by wangpy
+`nagatomo` includes code and layout assets derived from [toga](https://github.com/wangpy/toga) and [toga-shim](https://github.com/blindorange/toga-norns/)
