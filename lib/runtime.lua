@@ -20,9 +20,11 @@ local runtime = {
 local GRID_PORTS = 4
 local GRID_COLS = 16
 local GRID_ROWS = 8
+local GRID_CELL_COUNT = GRID_COLS * GRID_ROWS
 local ARC_PORTS = 4
 local ARC_COLS = 4
 local ARC_ROWS = 64
+local ARC_LED_COUNT = ARC_COLS * ARC_ROWS
 local SENT_UNKNOWN = -1
 
 local POLICY_ORDER = { "auto", "touchosc", "mirror" }
@@ -31,6 +33,33 @@ local POLICY_LABELS = {
   touchosc = "TouchOSC Only",
   mirror = "Mirror Both",
 }
+
+local GRID_PATHS = {}
+for index = 1, GRID_CELL_COUNT do
+  GRID_PATHS[index] = OSC_PATHS.grid_prefix .. index
+end
+
+local ARC_PATHS_GROUP1 = {}
+local ARC_PATHS_GROUP2 = {}
+for index = 1, ARC_LED_COUNT do
+  local ring = math.floor((index - 1) / ARC_ROWS) + 1
+  local led = ((index - 1) % ARC_ROWS) + 1
+  ARC_PATHS_GROUP1[index] = string.format("%sknob%d/group1/button%d", OSC_PATHS.arc_prefix, ring, led)
+  ARC_PATHS_GROUP2[index] = string.format("%sknob%d/group2/button%d", OSC_PATHS.arc_prefix, ring, led)
+end
+
+local CONNECTED_ARGS = {
+  [false] = { 0.0 },
+  [true] = { 1.0 },
+}
+
+local LEVEL_ARGS = {}
+for level = 0, 15 do
+  LEVEL_ARGS[level] = { level / 15.0 }
+end
+
+local TAU = math.pi * 2
+local ARC_STEP = TAU / ARC_ROWS
 
 local core = {
   grid = grid,
@@ -70,26 +99,52 @@ runtime.arc_virtual = {
 runtime.installed = false
 runtime.menu_redraw = nil
 
-local function create_buffer(width, height, initial)
+local function create_linear_buffer(length, initial)
   initial = initial or 0
   local buffer = {}
-  for x = 1, width do
-    buffer[x] = {}
-    for y = 1, height do
-      buffer[x][y] = initial
-    end
+  for i = 1, length do
+    buffer[i] = initial
   end
   return buffer
 end
 
+local function mark_index(flags, list, index)
+  if flags[index] then
+    return
+  end
+  flags[index] = true
+  list[#list + 1] = index
+end
+
+local function clear_index_list(flags, list)
+  for i = 1, #list do
+    flags[list[i]] = nil
+    list[i] = nil
+  end
+end
+
+local function grid_index(x, y)
+  return x + (y - 1) * GRID_COLS
+end
+
+local function arc_index(ring, led)
+  return led + (ring - 1) * ARC_ROWS
+end
+
 runtime.grid_state = {
-  current = create_buffer(GRID_COLS, GRID_ROWS, 0),
-  retry_pending = create_buffer(GRID_COLS, GRID_ROWS, false),
+  current = create_linear_buffer(GRID_CELL_COUNT, 0),
+  dirty_flags = {},
+  dirty_list = {},
+  retry_flags = {},
+  retry_list = {},
 }
 
 runtime.arc_state = {
-  current = create_buffer(ARC_COLS, ARC_ROWS, 0),
-  retry_pending = create_buffer(ARC_COLS, ARC_ROWS, false),
+  current = create_linear_buffer(ARC_LED_COUNT, 0),
+  dirty_flags = {},
+  dirty_list = {},
+  retry_flags = {},
+  retry_list = {},
 }
 
 local function ensure_dir(path)
@@ -122,12 +177,9 @@ local function normalize_from(from)
 end
 
 local function reset_client_transient(client)
-  client.grid_sent = create_buffer(GRID_COLS, GRID_ROWS, SENT_UNKNOWN)
-  client.arc_sent = create_buffer(ARC_COLS, ARC_ROWS, SENT_UNKNOWN)
-  client.arc_encoder_pos = {}
-  for ring = 1, ARC_COLS do
-    client.arc_encoder_pos[ring] = SENT_UNKNOWN
-  end
+  client.grid_sent = create_linear_buffer(GRID_CELL_COUNT, SENT_UNKNOWN)
+  client.arc_sent = create_linear_buffer(ARC_LED_COUNT, SENT_UNKNOWN)
+  client.arc_encoder_pos = create_linear_buffer(ARC_COLS, SENT_UNKNOWN)
 end
 
 local function make_client(host, port, last_seen, active)
@@ -136,6 +188,7 @@ local function make_client(host, port, last_seen, active)
     key = key,
     host = host,
     port = port,
+    to = { host, tostring(port) },
     last_seen = tonumber(last_seen) or 0,
     active = active == true,
   }
@@ -262,19 +315,35 @@ local function active_client_count()
 end
 
 local function clear_grid_retry_pending()
-  for y = 1, GRID_ROWS do
-    for x = 1, GRID_COLS do
-      runtime.grid_state.retry_pending[x][y] = false
-    end
-  end
+  clear_index_list(runtime.grid_state.retry_flags, runtime.grid_state.retry_list)
 end
 
 local function clear_arc_retry_pending()
-  for ring = 1, ARC_COLS do
-    for led = 1, ARC_ROWS do
-      runtime.arc_state.retry_pending[ring][led] = false
-    end
-  end
+  clear_index_list(runtime.arc_state.retry_flags, runtime.arc_state.retry_list)
+end
+
+local function clear_grid_dirty()
+  clear_index_list(runtime.grid_state.dirty_flags, runtime.grid_state.dirty_list)
+end
+
+local function clear_arc_dirty()
+  clear_index_list(runtime.arc_state.dirty_flags, runtime.arc_state.dirty_list)
+end
+
+local function mark_grid_dirty(index)
+  mark_index(runtime.grid_state.dirty_flags, runtime.grid_state.dirty_list, index)
+end
+
+local function mark_grid_retry(index)
+  mark_index(runtime.grid_state.retry_flags, runtime.grid_state.retry_list, index)
+end
+
+local function mark_arc_dirty(index)
+  mark_index(runtime.arc_state.dirty_flags, runtime.arc_state.dirty_list, index)
+end
+
+local function mark_arc_retry(index)
+  mark_index(runtime.arc_state.retry_flags, runtime.arc_state.retry_list, index)
 end
 
 grid_touchosc_enabled = function(port)
@@ -484,21 +553,70 @@ local function ensure_client(from)
 end
 
 local function send_osc(client, path, args)
-  core.osc.send({ client.host, client.port }, path, args)
+  core.osc.send(client.to, path, args)
 end
 
 local function send_connected(client, connected)
-  send_osc(client, OSC_PATHS.connection, { connected and 1.0 or 0.0 })
+  send_osc(client, OSC_PATHS.connection, CONNECTED_ARGS[connected == true])
+end
+
+local function send_grid_led_index(client, index, level)
+  send_osc(client, GRID_PATHS[index], LEVEL_ARGS[level])
 end
 
 local function send_grid_led(client, x, y, level)
-  local index = x + (y - 1) * GRID_COLS
-  send_osc(client, string.format("%s%d", OSC_PATHS.grid_prefix, index), { level / 15.0 })
+  send_grid_led_index(client, grid_index(x, y), level)
+end
+
+local function send_arc_led_index(client, index, level)
+  local args = LEVEL_ARGS[level]
+  send_osc(client, ARC_PATHS_GROUP1[index], args)
+  send_osc(client, ARC_PATHS_GROUP2[index], args)
 end
 
 local function send_arc_led(client, ring, led, level)
-  for group = 1, 2 do
-    send_osc(client, string.format("%sknob%d/group%d/button%d", OSC_PATHS.arc_prefix, ring, group, led), { level / 15.0 })
+  send_arc_led_index(client, arc_index(ring, led), level)
+end
+
+local function send_grid_state_to_client(client, force, retry_only)
+  if force then
+    for index = 1, GRID_CELL_COUNT do
+      local current = runtime.grid_state.current[index]
+      send_grid_led_index(client, index, current)
+      client.grid_sent[index] = current
+    end
+    return
+  end
+
+  local indices = retry_only and runtime.grid_state.retry_list or runtime.grid_state.dirty_list
+  for i = 1, #indices do
+    local index = indices[i]
+    local current = runtime.grid_state.current[index]
+    if retry_only or client.grid_sent[index] ~= current then
+      send_grid_led_index(client, index, current)
+      client.grid_sent[index] = current
+    end
+  end
+end
+
+local function send_arc_state_to_client(client, force, retry_only)
+  if force then
+    for index = 1, ARC_LED_COUNT do
+      local current = runtime.arc_state.current[index]
+      send_arc_led_index(client, index, current)
+      client.arc_sent[index] = current
+    end
+    return
+  end
+
+  local indices = retry_only and runtime.arc_state.retry_list or runtime.arc_state.dirty_list
+  for i = 1, #indices do
+    local index = indices[i]
+    local current = runtime.arc_state.current[index]
+    if retry_only or client.arc_sent[index] ~= current then
+      send_arc_led_index(client, index, current)
+      client.arc_sent[index] = current
+    end
   end
 end
 
@@ -507,17 +625,15 @@ local function send_grid_state(force, target_client, retry_only)
     return
   end
 
-  local clients = target_client and { target_client } or runtime.active_clients()
-  for _, client in ipairs(clients) do
-    for y = 1, GRID_ROWS do
-      for x = 1, GRID_COLS do
-        local current = runtime.grid_state.current[x][y]
-        local pending_retry = runtime.grid_state.retry_pending[x][y] == true
-        if force or (retry_only and pending_retry) or (not retry_only and client.grid_sent[x][y] ~= current) then
-          send_grid_led(client, x, y, current)
-          client.grid_sent[x][y] = current
-        end
-      end
+  if target_client ~= nil then
+    send_grid_state_to_client(target_client, force, retry_only)
+    return
+  end
+
+  for _, key in ipairs(runtime.client_order) do
+    local client = runtime.clients[key]
+    if client_is_active(client) then
+      send_grid_state_to_client(client, force, retry_only)
     end
   end
 end
@@ -527,29 +643,39 @@ local function send_arc_state(force, target_client, retry_only)
     return
   end
 
-  local clients = target_client and { target_client } or runtime.active_clients()
-  for _, client in ipairs(clients) do
-    for ring = 1, ARC_COLS do
-      for led = 1, ARC_ROWS do
-        local current = runtime.arc_state.current[ring][led]
-        local pending_retry = runtime.arc_state.retry_pending[ring][led] == true
-        if force or (retry_only and pending_retry) or (not retry_only and client.arc_sent[ring][led] ~= current) then
-          send_arc_led(client, ring, led, current)
-          client.arc_sent[ring][led] = current
-        end
-      end
+  if target_client ~= nil then
+    send_arc_state_to_client(target_client, force, retry_only)
+    return
+  end
+
+  for _, key in ipairs(runtime.client_order) do
+    local client = runtime.clients[key]
+    if client_is_active(client) then
+      send_arc_state_to_client(client, force, retry_only)
     end
   end
 end
 
 function runtime.resend_state(target_client, include_connected)
-  local clients = target_client and { target_client } or runtime.active_clients()
-  for _, client in ipairs(clients) do
+  if target_client ~= nil then
     if include_connected ~= false then
-      send_connected(client, true)
+      send_connected(target_client, true)
     end
-    send_grid_state(true, client)
-    send_arc_state(true, client)
+    send_grid_state(true, target_client)
+    send_arc_state(true, target_client)
+    mark_dirty()
+    return
+  end
+
+  for _, key in ipairs(runtime.client_order) do
+    local client = runtime.clients[key]
+    if client_is_active(client) then
+      if include_connected ~= false then
+        send_connected(client, true)
+      end
+      send_grid_state(true, client)
+      send_arc_state(true, client)
+    end
   end
   mark_dirty()
 end
@@ -634,35 +760,50 @@ function runtime.toggle_retry_writes()
 end
 
 function runtime.disconnect_all_clients()
-  for _, client in pairs(runtime.clients) do
-    if client.active then
+  for _, key in ipairs(runtime.client_order) do
+    local client = runtime.clients[key]
+    if client and client.active then
       send_connected(client, false)
       client.active = false
       reset_client_transient(client)
     end
   end
+  clear_grid_dirty()
   clear_grid_retry_pending()
+  clear_arc_dirty()
   clear_arc_retry_pending()
   print("[nagatomo] disconnected all active clients")
   mark_dirty()
 end
 
-local function reset_grid_state(level)
-  for y = 1, GRID_ROWS do
-    for x = 1, GRID_COLS do
-      runtime.grid_state.current[x][y] = level
-      runtime.grid_state.retry_pending[x][y] = false
-    end
+local function reset_grid_state(level, keep_dirty)
+  for index = 1, GRID_CELL_COUNT do
+    runtime.grid_state.current[index] = level
   end
+  if keep_dirty then
+    clear_grid_dirty()
+    for index = 1, GRID_CELL_COUNT do
+      mark_grid_dirty(index)
+    end
+  else
+    clear_grid_dirty()
+  end
+  clear_grid_retry_pending()
 end
 
-local function reset_arc_state(level)
-  for ring = 1, ARC_COLS do
-    for led = 1, ARC_ROWS do
-      runtime.arc_state.current[ring][led] = level
-      runtime.arc_state.retry_pending[ring][led] = false
-    end
+local function reset_arc_state(level, keep_dirty)
+  for index = 1, ARC_LED_COUNT do
+    runtime.arc_state.current[index] = level
   end
+  if keep_dirty then
+    clear_arc_dirty()
+    for index = 1, ARC_LED_COUNT do
+      mark_arc_dirty(index)
+    end
+  else
+    clear_arc_dirty()
+  end
+  clear_arc_retry_pending()
 end
 
 local function apply_level(current, level, rel)
@@ -672,43 +813,50 @@ local function apply_level(current, level, rel)
   return util.clamp(level, 0, 15)
 end
 
-local function set_grid_current(x, y, level, mark_retry)
-  if x < 1 or x > GRID_COLS or y < 1 or y > GRID_ROWS then
+local function set_grid_current_index(index, level, mark_retry)
+  if index < 1 or index > GRID_CELL_COUNT then
     return false
   end
-  if runtime.grid_state.current[x][y] == level then
+  if runtime.grid_state.current[index] == level then
     if mark_retry then
-      runtime.grid_state.retry_pending[x][y] = true
+      mark_grid_retry(index)
     end
     return false
   end
-  runtime.grid_state.current[x][y] = level
-  runtime.grid_state.retry_pending[x][y] = mark_retry == true
+  runtime.grid_state.current[index] = level
+  mark_grid_dirty(index)
+  if mark_retry then
+    mark_grid_retry(index)
+  end
   return true
 end
 
-local function set_arc_current(ring, led, level, mark_retry)
-  if ring < 1 or ring > ARC_COLS or led < 1 or led > ARC_ROWS then
+local function set_arc_current_index(index, level, mark_retry)
+  if index < 1 or index > ARC_LED_COUNT then
     return false
   end
-  if runtime.arc_state.current[ring][led] == level then
+  if runtime.arc_state.current[index] == level then
     if mark_retry then
-      runtime.arc_state.retry_pending[ring][led] = true
+      mark_arc_retry(index)
     end
     return false
   end
-  runtime.arc_state.current[ring][led] = level
-  runtime.arc_state.retry_pending[ring][led] = mark_retry == true
+  runtime.arc_state.current[index] = level
+  mark_arc_dirty(index)
+  if mark_retry then
+    mark_arc_retry(index)
+  end
   return true
 end
 
 function runtime.grid_led(port, x, y, level, rel)
   level = math.floor(level or 0)
   if port == 1 then
-    local current = runtime.grid_state.current[x] and runtime.grid_state.current[x][y]
+    local index = grid_index(x, y)
+    local current = runtime.grid_state.current[index]
     if current ~= nil then
       local next_level = apply_level(current, level, rel)
-      set_grid_current(x, y, next_level, runtime.prefs.retry_writes_enabled)
+      set_grid_current_index(index, next_level, runtime.prefs.retry_writes_enabled)
     end
   end
   if grid_physical_enabled(port) then
@@ -719,11 +867,9 @@ end
 function runtime.grid_all(port, level, rel)
   level = math.floor(level or 0)
   if port == 1 then
-    for y = 1, GRID_ROWS do
-      for x = 1, GRID_COLS do
-        local next_level = apply_level(runtime.grid_state.current[x][y], level, rel)
-        set_grid_current(x, y, next_level, runtime.prefs.retry_writes_enabled)
-      end
+    for index = 1, GRID_CELL_COUNT do
+      local next_level = apply_level(runtime.grid_state.current[index], level, rel)
+      set_grid_current_index(index, next_level, runtime.prefs.retry_writes_enabled)
     end
   end
   if grid_physical_enabled(port) then
@@ -733,12 +879,19 @@ end
 
 function runtime.grid_refresh(port, force)
   if port == 1 then
-    send_grid_state(force == true)
-    if force == true then
-      clear_grid_retry_pending()
-    elseif runtime.prefs.retry_writes_enabled then
-      send_grid_state(false, nil, true)
-      clear_grid_retry_pending()
+    if grid_touchosc_enabled(1) then
+      if force == true then
+        send_grid_state(true)
+        clear_grid_dirty()
+        clear_grid_retry_pending()
+      else
+        send_grid_state(false)
+        clear_grid_dirty()
+        if runtime.prefs.retry_writes_enabled then
+          send_grid_state(false, nil, true)
+          clear_grid_retry_pending()
+        end
+      end
     end
   end
   if grid_physical_enabled(port) then
@@ -767,10 +920,11 @@ end
 function runtime.arc_led(port, ring, led, level, rel)
   level = math.floor(level or 0)
   if port == 1 then
-    local current = runtime.arc_state.current[ring] and runtime.arc_state.current[ring][led]
+    local index = arc_index(ring, led)
+    local current = runtime.arc_state.current[index]
     if current ~= nil then
       local next_level = apply_level(current, level, rel)
-      set_arc_current(ring, led, next_level, runtime.prefs.retry_writes_enabled)
+      set_arc_current_index(index, next_level, runtime.prefs.retry_writes_enabled)
     end
   end
   if arc_physical_enabled(port) then
@@ -781,11 +935,9 @@ end
 function runtime.arc_all(port, level, rel)
   level = math.floor(level or 0)
   if port == 1 then
-    for ring = 1, ARC_COLS do
-      for led = 1, ARC_ROWS do
-        local next_level = apply_level(runtime.arc_state.current[ring][led], level, rel)
-        set_arc_current(ring, led, next_level, runtime.prefs.retry_writes_enabled)
-      end
+    for index = 1, ARC_LED_COUNT do
+      local next_level = apply_level(runtime.arc_state.current[index], level, rel)
+      set_arc_current_index(index, next_level, runtime.prefs.retry_writes_enabled)
     end
   end
   if arc_physical_enabled(port) then
@@ -793,38 +945,37 @@ function runtime.arc_all(port, level, rel)
   end
 end
 
+local function overlap_arc_ranges(a, b, c, d)
+  if a > b then
+    return overlap_arc_ranges(a, TAU, c, d) + overlap_arc_ranges(0, b, c, d)
+  end
+  if c > d then
+    return overlap_arc_ranges(a, b, c, TAU) + overlap_arc_ranges(a, b, 0, d)
+  end
+  return math.max(0, math.min(b, d) - math.max(a, c))
+end
+
+local function overlap_arc_segments(a, b, c, d)
+  a = a % TAU
+  b = b % TAU
+  c = c % TAU
+  d = d % TAU
+  return overlap_arc_ranges(a, b, c, d)
+end
+
 function runtime.arc_segment(port, ring, from_angle, to_angle, level, rel)
-  local tau = math.pi * 2
-
-  local function overlap(a, b, c, d)
-    if a > b then
-      return overlap(a, tau, c, d) + overlap(0, b, c, d)
-    elseif c > d then
-      return overlap(a, b, c, tau) + overlap(a, b, 0, d)
-    end
-    return math.max(0, math.min(b, d) - math.max(a, c))
-  end
-
-  local function overlap_segments(a, b, c, d)
-    a = a % tau
-    b = b % tau
-    c = c % tau
-    d = d % tau
-    return overlap(a, b, c, d)
-  end
-
-  local step = tau / ARC_ROWS
   level = math.floor(level or 0)
   for led = 1, ARC_ROWS do
-    local sa = step * (led - 1)
-    local sb = step * led
-    local amount = overlap_segments(from_angle, to_angle, sa, sb)
-    local brightness = util.round(amount / step * level)
+    local index = arc_index(ring, led)
+    local sa = ARC_STEP * (led - 1)
+    local sb = ARC_STEP * led
+    local amount = overlap_arc_segments(from_angle, to_angle, sa, sb)
+    local brightness = util.round(amount / ARC_STEP * level)
     if port == 1 then
-      local current = runtime.arc_state.current[ring] and runtime.arc_state.current[ring][led]
+      local current = runtime.arc_state.current[index]
       if current ~= nil then
         local next_level = apply_level(current, brightness, rel)
-        set_arc_current(ring, led, next_level, runtime.prefs.retry_writes_enabled)
+        set_arc_current_index(index, next_level, runtime.prefs.retry_writes_enabled)
       end
     end
     if arc_physical_enabled(port) then
@@ -835,12 +986,19 @@ end
 
 function runtime.arc_refresh(port, force)
   if port == 1 then
-    send_arc_state(force == true)
-    if force == true then
-      clear_arc_retry_pending()
-    elseif runtime.prefs.retry_writes_enabled then
-      send_arc_state(false, nil, true)
-      clear_arc_retry_pending()
+    if arc_touchosc_enabled(1) then
+      if force == true then
+        send_arc_state(true)
+        clear_arc_dirty()
+        clear_arc_retry_pending()
+      else
+        send_arc_state(false)
+        clear_arc_dirty()
+        if runtime.prefs.retry_writes_enabled then
+          send_arc_state(false, nil, true)
+          clear_arc_retry_pending()
+        end
+      end
     end
   end
   if arc_physical_enabled(port) then
@@ -864,9 +1022,11 @@ function runtime.grid_cleanup()
     vport.remove = nil
   end
   core.grid.cleanup()
-  reset_grid_state(0)
-  if active_client_count() > 0 and grid_touchosc_enabled(1) then
+  local should_send = active_client_count() > 0 and grid_touchosc_enabled(1)
+  reset_grid_state(0, not should_send)
+  if should_send then
     send_grid_state(true)
+    clear_grid_dirty()
   end
   runtime.refresh_ports()
   mark_dirty()
@@ -882,9 +1042,11 @@ function runtime.arc_cleanup()
     vport.remove = nil
   end
   core.arc.cleanup()
-  reset_arc_state(0)
-  if active_client_count() > 0 and arc_touchosc_enabled(1) then
+  local should_send = active_client_count() > 0 and arc_touchosc_enabled(1)
+  reset_arc_state(0, not should_send)
+  if should_send then
     send_arc_state(true)
+    clear_arc_dirty()
   end
   runtime.refresh_ports()
   mark_dirty()
@@ -912,9 +1074,10 @@ local function handle_grid_press(client, args, path)
     runtime.grid_vports[1].key(x, y, z)
   end
   if z == 0 then
-    local level = runtime.grid_state.current[x][y]
+    local index = grid_index(x, y)
+    local level = runtime.grid_state.current[index]
     send_grid_led(client, x, y, level)
-    client.grid_sent[x][y] = level
+    client.grid_sent[index] = level
   end
   return true
 end
@@ -1141,13 +1304,14 @@ function runtime.set_menu_redraw(func)
 end
 
 function runtime.run_light_test()
-  local clients = runtime.active_clients()
-
-  for _, client in ipairs(clients) do
-    send_connected(client, true)
-    for y = 1, GRID_ROWS do
-      for x = 1, GRID_COLS do
-        send_grid_led(client, x, y, ((x + y) % 2 == 0) and 12 or 3)
+  for _, key in ipairs(runtime.client_order) do
+    local client = runtime.clients[key]
+    if client_is_active(client) then
+      send_connected(client, true)
+      for y = 1, GRID_ROWS do
+        for x = 1, GRID_COLS do
+          send_grid_led(client, x, y, ((x + y) % 2 == 0) and 12 or 3)
+        end
       end
     end
   end
@@ -1165,13 +1329,16 @@ function runtime.run_light_test()
   local quarter = math.pi * 0.5
   local tau = math.pi * 2
   local step = tau / ARC_ROWS
-  for _, client in ipairs(clients) do
-    for ring = 1, ARC_COLS do
-      for led = 1, ARC_ROWS do
-        local sa = step * (led - 1)
-        local sb = step * led
-        local lit = math.max(0, math.min(sb, quarter) - math.max(sa, 0)) > 0
-        send_arc_led(client, ring, led, lit and 15 or 0)
+  for _, key in ipairs(runtime.client_order) do
+    local client = runtime.clients[key]
+    if client_is_active(client) then
+      for ring = 1, ARC_COLS do
+        for led = 1, ARC_ROWS do
+          local sa = step * (led - 1)
+          local sb = step * led
+          local lit = math.max(0, math.min(sb, quarter) - math.max(sa, 0)) > 0
+          send_arc_led(client, ring, led, lit and 15 or 0)
+        end
       end
     end
   end
