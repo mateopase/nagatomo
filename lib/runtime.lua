@@ -24,6 +24,8 @@ local GRID_ROWS = 8
 local ARC_PORTS = 4
 local ARC_COLS = 4
 local ARC_ROWS = 64
+local HOT_WINDOW_S = 0.75
+local SENT_UNKNOWN = -1
 
 local POLICY_ORDER = { "auto", "touchosc", "mirror" }
 local POLICY_LABELS = {
@@ -31,14 +33,6 @@ local POLICY_LABELS = {
   touchosc = "TouchOSC Only",
   mirror = "Mirror Both",
 }
-
-local function default_grid_add(dev)
-  return dev
-end
-
-local function default_arc_add(dev)
-  return dev
-end
 
 local core = {
   grid = grid,
@@ -54,11 +48,10 @@ local core = {
   norns_arc_delta = _norns.arc.delta,
   norns_osc_event = _norns.osc.event,
 }
-
-runtime.core = core
 runtime.prefs = {
   grid_policy = "auto",
   arc_policy = "auto",
+  scrub_enabled = true,
 }
 runtime.clients = {}
 runtime.client_order = {}
@@ -79,36 +72,26 @@ runtime.arc_virtual = {
 runtime.installed = false
 runtime.menu_redraw = nil
 
-local function create_buffer(width, height)
+local function create_buffer(width, height, initial)
+  initial = initial or 0
   local buffer = {}
   for x = 1, width do
     buffer[x] = {}
     for y = 1, height do
-      buffer[x][y] = 0
+      buffer[x][y] = initial
     end
   end
   return buffer
 end
 
-local function clone_buffer(source)
-  local copy = {}
-  for x, column in ipairs(source) do
-    copy[x] = {}
-    for y, value in ipairs(column) do
-      copy[x][y] = value
-    end
-  end
-  return copy
-end
-
 runtime.grid_state = {
-  new = create_buffer(GRID_COLS, GRID_ROWS),
-  sent = create_buffer(GRID_COLS, GRID_ROWS),
+  current = create_buffer(GRID_COLS, GRID_ROWS, 0),
+  hot_until = create_buffer(GRID_COLS, GRID_ROWS, 0),
 }
 
 runtime.arc_state = {
-  new = create_buffer(ARC_COLS, ARC_ROWS),
-  sent = create_buffer(ARC_COLS, ARC_ROWS),
+  current = create_buffer(ARC_COLS, ARC_ROWS, 0),
+  hot_until = create_buffer(ARC_COLS, ARC_ROWS, 0),
 }
 
 local function ensure_dir(path)
@@ -127,6 +110,9 @@ local function now_s()
   return util.time()
 end
 
+local grid_touchosc_enabled
+local arc_touchosc_enabled
+
 local function client_key(host, port)
   return tostring(host) .. ":" .. tostring(port)
 end
@@ -135,6 +121,30 @@ local function normalize_from(from)
   local host = from and from[1] or "unknown"
   local port = tonumber(from and from[2]) or tostring(from and from[2] or "0")
   return host, port
+end
+
+local function reset_client_transient(client)
+  client.grid_sent = create_buffer(GRID_COLS, GRID_ROWS, SENT_UNKNOWN)
+  client.arc_sent = create_buffer(ARC_COLS, ARC_ROWS, SENT_UNKNOWN)
+  client.arc_encoder_pos = {}
+  for ring = 1, ARC_COLS do
+    client.arc_encoder_pos[ring] = SENT_UNKNOWN
+  end
+end
+
+local function make_client(host, port, first_seen, last_seen, active, capabilities)
+  local key = client_key(host, port)
+  local client = {
+    key = key,
+    host = host,
+    port = port,
+    first_seen = tonumber(first_seen) or now_s(),
+    last_seen = tonumber(last_seen) or 0,
+    active = active == true,
+    capabilities = capabilities or {},
+  }
+  reset_client_transient(client)
+  return client
 end
 
 local function has_capability(client, name)
@@ -179,6 +189,22 @@ local function client_is_fresh(client)
   return (now_s() - (client.last_seen or 0)) <= runtime.client_timeout_s
 end
 
+local function sweep_inactive_clients()
+  local changed = false
+  for _, key in ipairs(runtime.client_order) do
+    local client = runtime.clients[key]
+    if client and client.active and not client_is_fresh(client) then
+      client.active = false
+      reset_client_transient(client)
+      print(string.format("[nagatomo] client timed out: %s:%s", client.host, tostring(client.port)))
+      changed = true
+    end
+  end
+  if changed then
+    mark_dirty()
+  end
+end
+
 local function snapshot_client(client)
   return {
     host = client.host,
@@ -216,18 +242,16 @@ local function load_clients()
 
   for _, entry in ipairs(saved) do
     if type(entry) == "table" and entry.host and entry.port then
-      local key = client_key(entry.host, entry.port)
-      runtime.clients[key] = {
-        key = key,
-        host = entry.host,
-        port = entry.port,
-        first_seen = tonumber(entry.first_seen) or now_s(),
-        last_seen = tonumber(entry.last_seen) or 0,
-        active = false,
-        capabilities = decode_capabilities(entry.capabilities),
-        arc_encoder_pos = {},
-      }
-      table.insert(runtime.client_order, key)
+      local client = make_client(
+        entry.host,
+        entry.port,
+        entry.first_seen,
+        entry.last_seen,
+        false,
+        decode_capabilities(entry.capabilities)
+      )
+      runtime.clients[client.key] = client
+      table.insert(runtime.client_order, client.key)
     end
   end
 end
@@ -237,6 +261,7 @@ local function save_prefs()
   tabutil.save({
     grid_policy = runtime.prefs.grid_policy,
     arc_policy = runtime.prefs.arc_policy,
+    scrub_enabled = runtime.prefs.scrub_enabled,
   }, runtime.prefs_fn)
 end
 
@@ -256,6 +281,9 @@ local function load_prefs()
   end
   if POLICY_LABELS[saved.arc_policy] then
     runtime.prefs.arc_policy = saved.arc_policy
+  end
+  if type(saved.scrub_enabled) == "boolean" then
+    runtime.prefs.scrub_enabled = saved.scrub_enabled
   end
 end
 
@@ -284,6 +312,7 @@ local function arc_has_physical(port)
 end
 
 local function active_client_count()
+  sweep_inactive_clients()
   local count = 0
   for _, client in pairs(runtime.clients) do
     if client_is_active(client) then
@@ -293,7 +322,7 @@ local function active_client_count()
   return count
 end
 
-local function grid_touchosc_enabled(port)
+grid_touchosc_enabled = function(port)
   local policy = runtime.prefs.grid_policy
   if port ~= 1 then
     return false
@@ -311,7 +340,7 @@ local function grid_physical_enabled(port)
   return grid_has_physical(port)
 end
 
-local function arc_touchosc_enabled(port)
+arc_touchosc_enabled = function(port)
   local policy = runtime.prefs.arc_policy
   if port ~= 1 then
     return false
@@ -337,58 +366,96 @@ local function arc_virtual_available(port)
   return port == 1
 end
 
-local function current_grid_device(port)
+local function grid_port_mode(port)
+  if port ~= 1 then
+    return grid_has_physical(port) and "physical" or "none"
+  end
+  if runtime.prefs.grid_policy == "touchosc" then
+    return grid_virtual_available(port) and "virtual" or "none"
+  end
   if grid_has_physical(port) then
+    return "physical"
+  end
+  return grid_virtual_available(port) and "virtual" or "none"
+end
+
+local function arc_port_mode(port)
+  if port ~= 1 then
+    return arc_has_physical(port) and "physical" or "none"
+  end
+  if runtime.prefs.arc_policy == "touchosc" then
+    return arc_virtual_available(port) and "virtual" or "none"
+  end
+  if arc_has_physical(port) then
+    return "physical"
+  end
+  return arc_virtual_available(port) and "virtual" or "none"
+end
+
+local function current_grid_device(port)
+  local mode = grid_port_mode(port)
+  if mode == "physical" then
     return core.grid.vports[port].device
   end
-  if grid_virtual_available(port) then
+  if mode == "virtual" then
     return runtime.grid_virtual
   end
   return nil
 end
 
 local function current_arc_device(port)
-  if arc_has_physical(port) then
+  local mode = arc_port_mode(port)
+  if mode == "physical" then
     return core.arc.vports[port].device
   end
-  if arc_virtual_available(port) then
+  if mode == "virtual" then
     return runtime.arc_virtual
   end
   return nil
 end
 
 local function grid_port_name(port)
-  if grid_has_physical(port) then
+  local mode = grid_port_mode(port)
+  if mode == "physical" then
     return core.grid.vports[port].name
   end
-  return default_grid_name(port)
+  if mode == "virtual" then
+    return default_grid_name(port)
+  end
+  return "none"
 end
 
 local function grid_port_cols(port)
-  if grid_has_physical(port) then
+  local mode = grid_port_mode(port)
+  if mode == "physical" then
     return core.grid.vports[port].cols
   end
-  if grid_virtual_available(port) then
+  if mode == "virtual" then
     return GRID_COLS
   end
   return 0
 end
 
 local function grid_port_rows(port)
-  if grid_has_physical(port) then
+  local mode = grid_port_mode(port)
+  if mode == "physical" then
     return core.grid.vports[port].rows
   end
-  if grid_virtual_available(port) then
+  if mode == "virtual" then
     return GRID_ROWS
   end
   return 0
 end
 
 local function arc_port_name(port)
-  if arc_has_physical(port) then
+  local mode = arc_port_mode(port)
+  if mode == "physical" then
     return core.arc.vports[port].name
   end
-  return default_arc_name(port)
+  if mode == "virtual" then
+    return default_arc_name(port)
+  end
+  return "none"
 end
 
 local function refresh_grid_port(port)
@@ -429,12 +496,14 @@ local function list_clients(filter)
 end
 
 function runtime.active_clients()
+  sweep_inactive_clients()
   return list_clients(function(client)
     return client_is_active(client)
   end)
 end
 
 function runtime.recent_clients()
+  sweep_inactive_clients()
   return list_clients(function(client)
     return not client_is_active(client)
   end)
@@ -449,22 +518,16 @@ local function ensure_client(from, capability)
 
   if client == nil then
     created = true
-    client = {
-      key = key,
-      host = host,
-      port = port,
-      first_seen = now_s(),
-      last_seen = now_s(),
-      active = true,
-      capabilities = {},
-      arc_encoder_pos = {},
-    }
+    client = make_client(host, port, now_s(), now_s(), true, {})
     runtime.clients[key] = client
     table.insert(runtime.client_order, key)
   else
     reactivated = not client_is_active(client)
     client.active = true
     client.last_seen = now_s()
+    if reactivated then
+      reset_client_transient(client)
+    end
   end
 
   local capability_changed = false
@@ -478,17 +541,6 @@ local function ensure_client(from, capability)
 
   mark_dirty()
   return client, created, reactivated
-end
-
-local function set_client_active(client, active)
-  if client == nil then
-    return
-  end
-  client.active = active
-  if active then
-    client.last_seen = now_s()
-  end
-  mark_dirty()
 end
 
 local function send_osc(client, path, args)
@@ -510,55 +562,52 @@ local function send_arc_led(client, ring, led, level)
   end
 end
 
-local function send_grid_state(force, target_client)
+local function send_grid_state(force, target_client, hot_only)
+  sweep_inactive_clients()
   if not grid_touchosc_enabled(1) then
     return
   end
 
+  local now = now_s()
   local clients = target_client and { target_client } or runtime.active_clients()
   for _, client in ipairs(clients) do
     for y = 1, GRID_ROWS do
       for x = 1, GRID_COLS do
-        local current = runtime.grid_state.new[x][y]
-        if force or runtime.grid_state.sent[x][y] ~= current then
+        local current = runtime.grid_state.current[x][y]
+        local is_hot = runtime.grid_state.hot_until[x][y] > now
+        if force or (hot_only and is_hot) or (not hot_only and client.grid_sent[x][y] ~= current) then
           send_grid_led(client, x, y, current)
+          client.grid_sent[x][y] = current
         end
       end
-    end
-  end
-
-  for y = 1, GRID_ROWS do
-    for x = 1, GRID_COLS do
-      runtime.grid_state.sent[x][y] = runtime.grid_state.new[x][y]
     end
   end
 end
 
-local function send_arc_state(force, target_client)
+local function send_arc_state(force, target_client, hot_only)
+  sweep_inactive_clients()
   if not arc_touchosc_enabled(1) then
     return
   end
 
+  local now = now_s()
   local clients = target_client and { target_client } or runtime.active_clients()
   for _, client in ipairs(clients) do
     for ring = 1, ARC_COLS do
       for led = 1, ARC_ROWS do
-        local current = runtime.arc_state.new[ring][led]
-        if force or runtime.arc_state.sent[ring][led] ~= current then
+        local current = runtime.arc_state.current[ring][led]
+        local is_hot = runtime.arc_state.hot_until[ring][led] > now
+        if force or (hot_only and is_hot) or (not hot_only and client.arc_sent[ring][led] ~= current) then
           send_arc_led(client, ring, led, current)
+          client.arc_sent[ring][led] = current
         end
       end
-    end
-  end
-
-  for ring = 1, ARC_COLS do
-    for led = 1, ARC_ROWS do
-      runtime.arc_state.sent[ring][led] = runtime.arc_state.new[ring][led]
     end
   end
 end
 
 function runtime.resend_state(target_client, include_connected)
+  sweep_inactive_clients()
   local clients = target_client and { target_client } or runtime.active_clients()
   for _, client in ipairs(clients) do
     if include_connected ~= false then
@@ -568,18 +617,6 @@ function runtime.resend_state(target_client, include_connected)
     send_arc_state(true, client)
   end
   mark_dirty()
-end
-
-local function reconnect_known_clients()
-  for _, key in ipairs(runtime.client_order) do
-    local client = runtime.clients[key]
-    if client then
-      send_connected(client, true)
-      send_grid_state(true, client)
-      send_arc_state(true, client)
-    end
-  end
-  print("[nagatomo] reconnect requested for known clients")
 end
 
 local function age_string(timestamp)
@@ -601,20 +638,23 @@ local function age_string(timestamp)
 end
 
 function runtime.describe_client(client)
-  local state = client_is_active(client) and (client_is_fresh(client) and "active" or "idle") or "recent"
+  local state = client_is_active(client) and "active" or "recent"
   return string.format("%s:%s %s %s", client.host, tostring(client.port), state, age_string(client.last_seen))
 end
 
 function runtime.status()
+  local active_clients = runtime.active_clients()
+  local recent_clients = runtime.recent_clients()
   return {
     grid_policy = POLICY_LABELS[runtime.prefs.grid_policy],
     arc_policy = POLICY_LABELS[runtime.prefs.arc_policy],
-    active_clients = runtime.active_clients(),
-    recent_clients = runtime.recent_clients(),
+    scrub_enabled = runtime.prefs.scrub_enabled,
+    active_clients = active_clients,
+    recent_clients = recent_clients,
     grid_bound = runtime.grid_vports[1].key ~= nil or runtime.grid_vports[1].tilt ~= nil,
     arc_bound = runtime.arc_vports[1].key ~= nil or runtime.arc_vports[1].delta ~= nil,
     script_name = norns.state.name,
-    total_active = active_client_count(),
+    total_active = #active_clients,
   }
 end
 
@@ -643,15 +683,10 @@ function runtime.cycle_arc_policy()
   cycle_policy("arc_policy")
 end
 
-function runtime.policy_label(kind)
-  return POLICY_LABELS[runtime.prefs[kind]]
-end
-
-function runtime.clear_active_clients()
-  for _, client in pairs(runtime.clients) do
-    client.active = false
-  end
-  print("[nagatomo] cleared active client sessions")
+function runtime.toggle_scrub()
+  runtime.prefs.scrub_enabled = not runtime.prefs.scrub_enabled
+  save_prefs()
+  print(string.format("[nagatomo] scrub -> %s", runtime.prefs.scrub_enabled and "on" or "off"))
   mark_dirty()
 end
 
@@ -663,51 +698,97 @@ function runtime.forget_client_history()
   mark_dirty()
 end
 
-local function reset_grid_buffers(level)
+local function reset_grid_state(level)
   for y = 1, GRID_ROWS do
     for x = 1, GRID_COLS do
-      runtime.grid_state.new[x][y] = level
-      runtime.grid_state.sent[x][y] = level
+      runtime.grid_state.current[x][y] = level
+      runtime.grid_state.hot_until[x][y] = 0
     end
   end
 end
 
-local function reset_arc_buffers(level)
+local function reset_arc_state(level)
   for ring = 1, ARC_COLS do
     for led = 1, ARC_ROWS do
-      runtime.arc_state.new[ring][led] = level
-      runtime.arc_state.sent[ring][led] = level
+      runtime.arc_state.current[ring][led] = level
+      runtime.arc_state.hot_until[ring][led] = 0
     end
   end
 end
 
-function runtime.grid_led(port, x, y, level)
-  level = util.clamp(math.floor(level or 0), 0, 15)
-  if port == 1 and x >= 1 and x <= GRID_COLS and y >= 1 and y <= GRID_ROWS then
-    runtime.grid_state.new[x][y] = level
+local function apply_level(current, level, rel)
+  if rel then
+    return util.clamp(current + level, 0, 15)
+  end
+  return util.clamp(level, 0, 15)
+end
+
+local function set_grid_current(x, y, level, hot_until, mark_hot_when_unchanged)
+  if x < 1 or x > GRID_COLS or y < 1 or y > GRID_ROWS then
+    return false
+  end
+  if runtime.grid_state.current[x][y] == level then
+    if mark_hot_when_unchanged then
+      runtime.grid_state.hot_until[x][y] = hot_until or (now_s() + HOT_WINDOW_S)
+    end
+    return false
+  end
+  runtime.grid_state.current[x][y] = level
+  runtime.grid_state.hot_until[x][y] = hot_until or (now_s() + HOT_WINDOW_S)
+  return true
+end
+
+local function set_arc_current(ring, led, level, hot_until, mark_hot_when_unchanged)
+  if ring < 1 or ring > ARC_COLS or led < 1 or led > ARC_ROWS then
+    return false
+  end
+  if runtime.arc_state.current[ring][led] == level then
+    if mark_hot_when_unchanged then
+      runtime.arc_state.hot_until[ring][led] = hot_until or (now_s() + HOT_WINDOW_S)
+    end
+    return false
+  end
+  runtime.arc_state.current[ring][led] = level
+  runtime.arc_state.hot_until[ring][led] = hot_until or (now_s() + HOT_WINDOW_S)
+  return true
+end
+
+function runtime.grid_led(port, x, y, level, rel)
+  level = math.floor(level or 0)
+  if port == 1 then
+    local current = runtime.grid_state.current[x] and runtime.grid_state.current[x][y]
+    if current ~= nil then
+      local next_level = apply_level(current, level, rel)
+      set_grid_current(x, y, next_level, nil, runtime.prefs.scrub_enabled)
+    end
   end
   if grid_physical_enabled(port) then
-    core.grid.vports[port]:led(x, y, level)
+    core.grid.vports[port]:led(x, y, rel and level or util.clamp(level, 0, 15), rel)
   end
 end
 
-function runtime.grid_all(port, level)
-  level = util.clamp(math.floor(level or 0), 0, 15)
+function runtime.grid_all(port, level, rel)
+  level = math.floor(level or 0)
   if port == 1 then
+    local hot_until = now_s() + HOT_WINDOW_S
     for y = 1, GRID_ROWS do
       for x = 1, GRID_COLS do
-        runtime.grid_state.new[x][y] = level
+        local next_level = apply_level(runtime.grid_state.current[x][y], level, rel)
+        set_grid_current(x, y, next_level, hot_until, runtime.prefs.scrub_enabled)
       end
     end
   end
   if grid_physical_enabled(port) then
-    core.grid.vports[port]:all(level)
+    core.grid.vports[port]:all(rel and level or util.clamp(level, 0, 15), rel)
   end
 end
 
 function runtime.grid_refresh(port, force)
   if port == 1 then
     send_grid_state(force == true)
+    if force ~= true and runtime.prefs.scrub_enabled then
+      send_grid_state(false, nil, true)
+    end
   end
   if grid_physical_enabled(port) then
     core.grid.vports[port]:refresh()
@@ -732,31 +813,37 @@ function runtime.grid_tilt_enable(port, id, value)
   end
 end
 
-function runtime.arc_led(port, ring, led, level)
-  level = util.clamp(math.floor(level or 0), 0, 15)
-  if port == 1 and ring >= 1 and ring <= ARC_COLS and led >= 1 and led <= ARC_ROWS then
-    runtime.arc_state.new[ring][led] = level
+function runtime.arc_led(port, ring, led, level, rel)
+  level = math.floor(level or 0)
+  if port == 1 then
+    local current = runtime.arc_state.current[ring] and runtime.arc_state.current[ring][led]
+    if current ~= nil then
+      local next_level = apply_level(current, level, rel)
+      set_arc_current(ring, led, next_level, nil, runtime.prefs.scrub_enabled)
+    end
   end
   if arc_physical_enabled(port) then
-    core.arc.vports[port]:led(ring, led, level)
+    core.arc.vports[port]:led(ring, led, rel and level or util.clamp(level, 0, 15), rel)
   end
 end
 
-function runtime.arc_all(port, level)
-  level = util.clamp(math.floor(level or 0), 0, 15)
+function runtime.arc_all(port, level, rel)
+  level = math.floor(level or 0)
   if port == 1 then
+    local hot_until = now_s() + HOT_WINDOW_S
     for ring = 1, ARC_COLS do
       for led = 1, ARC_ROWS do
-        runtime.arc_state.new[ring][led] = level
+        local next_level = apply_level(runtime.arc_state.current[ring][led], level, rel)
+        set_arc_current(ring, led, next_level, hot_until, runtime.prefs.scrub_enabled)
       end
     end
   end
   if arc_physical_enabled(port) then
-    core.arc.vports[port]:all(level)
+    core.arc.vports[port]:all(rel and level or util.clamp(level, 0, 15), rel)
   end
 end
 
-function runtime.arc_segment(port, ring, from_angle, to_angle, level)
+function runtime.arc_segment(port, ring, from_angle, to_angle, level, rel)
   local tau = math.pi * 2
 
   local function overlap(a, b, c, d)
@@ -777,18 +864,32 @@ function runtime.arc_segment(port, ring, from_angle, to_angle, level)
   end
 
   local step = tau / ARC_ROWS
+  local hot_until = now_s() + HOT_WINDOW_S
+  level = math.floor(level or 0)
   for led = 1, ARC_ROWS do
     local sa = step * (led - 1)
     local sb = step * led
     local amount = overlap_segments(from_angle, to_angle, sa, sb)
     local brightness = util.round(amount / step * level)
-    runtime.arc_led(port, ring, led, brightness)
+    if port == 1 then
+      local current = runtime.arc_state.current[ring] and runtime.arc_state.current[ring][led]
+      if current ~= nil then
+        local next_level = apply_level(current, brightness, rel)
+        set_arc_current(ring, led, next_level, hot_until, runtime.prefs.scrub_enabled)
+      end
+    end
+    if arc_physical_enabled(port) then
+      core.arc.vports[port]:led(ring, led, rel and brightness or util.clamp(brightness, 0, 15), rel)
+    end
   end
 end
 
 function runtime.arc_refresh(port, force)
   if port == 1 then
     send_arc_state(force == true)
+    if force ~= true and runtime.prefs.scrub_enabled then
+      send_arc_state(false, nil, true)
+    end
   end
   if arc_physical_enabled(port) then
     core.arc.vports[port]:refresh()
@@ -802,8 +903,8 @@ function runtime.arc_intensity(port, value)
 end
 
 function runtime.grid_cleanup()
-  runtime.grid_api.add = default_grid_add
-  runtime.grid_api.remove = function() end
+  runtime.grid_api.add = nil
+  runtime.grid_api.remove = nil
   for port = 1, GRID_PORTS do
     local vport = runtime.grid_vports[port]
     vport.key = nil
@@ -811,19 +912,17 @@ function runtime.grid_cleanup()
     vport.remove = nil
   end
   core.grid.cleanup()
-  reset_grid_buffers(0)
+  reset_grid_state(0)
   if active_client_count() > 0 and grid_touchosc_enabled(1) then
     send_grid_state(true)
   end
   runtime.refresh_ports()
-  if _menu and _menu.mode and _menu.page == "MODS" then
-    mark_dirty()
-  end
+  mark_dirty()
 end
 
 function runtime.arc_cleanup()
-  runtime.arc_api.add = default_arc_add
-  runtime.arc_api.remove = function() end
+  runtime.arc_api.add = nil
+  runtime.arc_api.remove = nil
   for port = 1, ARC_PORTS do
     local vport = runtime.arc_vports[port]
     vport.key = nil
@@ -831,30 +930,39 @@ function runtime.arc_cleanup()
     vport.remove = nil
   end
   core.arc.cleanup()
-  reset_arc_buffers(0)
+  reset_arc_state(0)
   if active_client_count() > 0 and arc_touchosc_enabled(1) then
     send_arc_state(true)
   end
   runtime.refresh_ports()
-  if _menu and _menu.mode and _menu.page == "MODS" then
-    mark_dirty()
-  end
+  mark_dirty()
 end
 
-local function handle_grid_press(client, args, path)
+local function parse_grid_press(path, args)
   local index = tonumber(path:match("^" .. OSC_PATHS.grid_prefix .. "(%d+)$"))
-  if index == nil then
-    return false
+  if index == nil or index < 1 or index > (GRID_COLS * GRID_ROWS) then
+    return nil
   end
 
   local x = ((index - 1) % GRID_COLS) + 1
   local y = math.floor((index - 1) / GRID_COLS) + 1
   local z = (tonumber(args[1]) or 0) > 0 and 1 or 0
+  return x, y, z
+end
+
+local function handle_grid_press(client, args, path)
+  local x, y, z = parse_grid_press(path, args)
+  if x == nil then
+    return false
+  end
+
   if grid_touchosc_enabled(1) and runtime.grid_vports[1].key then
     runtime.grid_vports[1].key(x, y, z)
   end
   if z == 0 then
-    send_grid_led(client, x, y, runtime.grid_state.new[x][y])
+    local level = runtime.grid_state.current[x][y]
+    send_grid_led(client, x, y, level)
+    client.grid_sent[x][y] = level
   end
   return true
 end
@@ -877,27 +985,44 @@ local function arc_delta_for_client(client, ring, position)
   return tonumber(string.format("%.0f", delta * 500))
 end
 
-local function handle_arc_message(client, args, path)
+local function parse_arc_message(path, args)
   local ring, suffix = path:match("^" .. OSC_PATHS.arc_prefix .. "knob(%d+)(/[%w_]+)$")
   if ring == nil or suffix == nil then
-    return false
+    return nil
   end
 
   ring = tonumber(ring)
   if ring == nil or ring < 1 or ring > ARC_COLS then
-    return false
+    return nil
   end
 
   if suffix == "/button" or suffix == "/button1" then
-    local state = (tonumber(args[1]) or 0) > 0 and 1 or 0
+    return ring, "button", (tonumber(args[1]) or 0) > 0 and 1 or 0
+  end
+
+  if suffix == "/encoder" or suffix == "/encoder1" then
+    return ring, "encoder", tonumber(args[1]) or 0
+  end
+
+  return nil
+end
+
+local function handle_arc_message(client, args, path)
+  local ring, kind, value = parse_arc_message(path, args)
+  if ring == nil then
+    return false
+  end
+
+  if kind == "button" then
+    local state = value
     if arc_touchosc_enabled(1) and runtime.arc_vports[1].key then
       runtime.arc_vports[1].key(ring, state)
     end
     return true
   end
 
-  if suffix == "/encoder" or suffix == "/encoder1" then
-    local position = tonumber(args[1]) or 0
+  if kind == "encoder" then
+    local position = value
     local delta = arc_delta_for_client(client, ring, position)
     if delta ~= 0 and arc_touchosc_enabled(1) and runtime.arc_vports[1].delta then
       runtime.arc_vports[1].delta(ring, delta)
@@ -908,14 +1033,21 @@ local function handle_arc_message(client, args, path)
   return false
 end
 
-local function handle_connection(client, args)
+local function handle_connection(args, from)
   local requested = (tonumber(args[1]) or 1) > 0
   if not requested then
-    client.last_seen = now_s()
+    local host, port = normalize_from(from)
+    local client = runtime.clients[client_key(host, port)]
+    if client ~= nil then
+      client.last_seen = now_s()
+      mark_dirty()
+    end
     return true
   end
 
-  set_client_active(client, true)
+  local client = ensure_client(from, "connection")
+  client.active = true
+  client.last_seen = now_s()
   send_connected(client, true)
   send_grid_state(true, client)
   send_arc_state(true, client)
@@ -928,38 +1060,16 @@ local function handle_touchosc(path, args, from)
     return false
   end
 
-  if type(path) ~= "string" then
-    return false
-  end
-
-  local is_touchosc_message =
-    path == OSC_PATHS.connection or
-    util.string_starts(path, OSC_PATHS.grid_prefix) or
-    util.string_starts(path, OSC_PATHS.arc_prefix)
-
-  if not is_touchosc_message then
-    return false
-  end
-
-  local capability = "connection"
-  if util.string_starts(path, OSC_PATHS.grid_prefix) then
-    capability = "grid"
-  elseif util.string_starts(path, OSC_PATHS.arc_prefix) then
-    capability = "arc"
-  end
-
-  local client, created, reactivated = ensure_client(from, capability)
-  if created or reactivated then
-    for ring = 1, ARC_COLS do
-      client.arc_encoder_pos[ring] = -1
-    end
-  end
-
   if path == OSC_PATHS.connection then
-    return handle_connection(client, args or {})
+    return handle_connection(args or {}, from)
   end
 
   if util.string_starts(path, OSC_PATHS.grid_prefix) then
+    local x = parse_grid_press(path, args or {})
+    if x == nil then
+      return false
+    end
+    local client, created, reactivated = ensure_client(from, "grid")
     if created or reactivated then
       send_connected(client, true)
       send_grid_state(true, client)
@@ -969,6 +1079,11 @@ local function handle_touchosc(path, args, from)
   end
 
   if util.string_starts(path, OSC_PATHS.arc_prefix) then
+    local ring = parse_arc_message(path, args or {})
+    if ring == nil then
+      return false
+    end
+    local client, created, reactivated = ensure_client(from, "arc")
     if created or reactivated then
       send_connected(client, true)
       send_grid_state(true, client)
@@ -1074,6 +1189,7 @@ function runtime.set_menu_redraw(func)
 end
 
 function runtime.run_light_test()
+  sweep_inactive_clients()
   local clients = runtime.active_clients()
 
   for _, client in ipairs(clients) do
@@ -1129,16 +1245,16 @@ runtime.grid_api = {
   devices = core.grid.devices,
   vports = {},
   help = core.grid.help,
-  add = default_grid_add,
-  remove = function() end,
+  add = nil,
+  remove = nil,
 }
 
 runtime.arc_api = {
   devices = core.arc.devices,
   vports = {},
   help = core.arc.help,
-  add = default_arc_add,
-  remove = function() end,
+  add = nil,
+  remove = nil,
 }
 
 for port = 1, GRID_PORTS do
@@ -1152,11 +1268,11 @@ for port = 1, GRID_PORTS do
     remove = nil,
     cols = port == 1 and GRID_COLS or 0,
     rows = port == 1 and GRID_ROWS or 0,
-    led = function(self, x, y, level)
-      runtime.grid_led(self.port, x, y, level)
+    led = function(self, x, y, level, rel)
+      runtime.grid_led(self.port, x, y, level, rel)
     end,
-    all = function(self, level)
-      runtime.grid_all(self.port, level)
+    all = function(self, level, rel)
+      runtime.grid_all(self.port, level, rel)
     end,
     refresh = function(self, force)
       runtime.grid_refresh(self.port, force)
@@ -1183,17 +1299,17 @@ for port = 1, ARC_PORTS do
     delta = nil,
     key = nil,
     remove = nil,
-    led = function(self, ring, led, level)
-      runtime.arc_led(self.port, ring, led, level)
+    led = function(self, ring, led, level, rel)
+      runtime.arc_led(self.port, ring, led, level, rel)
     end,
-    all = function(self, level)
-      runtime.arc_all(self.port, level)
+    all = function(self, level, rel)
+      runtime.arc_all(self.port, level, rel)
     end,
     refresh = function(self, force)
       runtime.arc_refresh(self.port, force)
     end,
-    segment = function(self, ring, from_angle, to_angle, level)
-      runtime.arc_segment(self.port, ring, from_angle, to_angle, level)
+    segment = function(self, ring, from_angle, to_angle, level, rel)
+      runtime.arc_segment(self.port, ring, from_angle, to_angle, level, rel)
     end,
     intensity = function(self, value)
       runtime.arc_intensity(self.port, value)
@@ -1267,24 +1383,6 @@ function runtime.install()
   runtime.installed = true
   print("[nagatomo] installed runtime")
   return runtime
-end
-
-function runtime.snapshot_clients()
-  local snapshots = {}
-  for _, key in ipairs(runtime.client_order) do
-    local client = runtime.clients[key]
-    if client then
-      table.insert(snapshots, {
-        label = runtime.describe_client(client),
-        active = client_is_active(client),
-      })
-    end
-  end
-  return snapshots
-end
-
-function runtime.reconnect_known_clients()
-  reconnect_known_clients()
 end
 
 return runtime

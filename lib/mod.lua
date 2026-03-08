@@ -54,6 +54,14 @@ local function build_rows()
       action = runtime.cycle_arc_policy,
     },
     {
+      kind = "action",
+      name = "scrub",
+      value = function()
+        return status.scrub_enabled and "on" or "off"
+      end,
+      action = runtime.toggle_scrub,
+    },
+    {
       kind = "info",
       name = "bindings",
       value = function()
@@ -163,7 +171,7 @@ end
 
 local function selected_row()
   local rows = current_rows()
-  return rows[menu.index], rows
+  return rows[menu.index]
 end
 
 function menu.init()
@@ -182,27 +190,6 @@ end
 
 function menu.deinit()
   menu.reset()
-end
-
-function menu.refresh()
-end
-
-function menu.keycode(_, _)
-end
-
-function menu.keychar(_)
-end
-
-function menu.gamepad_axis(_, _)
-end
-
-function menu.gamepad_dpad(_, _)
-end
-
-function menu.gamepad_button(_, _)
-end
-
-function menu.gamepad_analog(_, _, _)
 end
 
 function menu.redraw()
@@ -279,7 +266,7 @@ function menu.key(n, z)
 end
 
 function menu.enc(n, d)
-  if n ~= 2 then
+  if n ~= 2 or d == 0 then
     return
   end
 
