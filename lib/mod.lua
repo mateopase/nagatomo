@@ -44,6 +44,7 @@ local function build_rows()
         return string.lower(status.grid_policy)
       end,
       action = runtime.cycle_grid_policy,
+      enc_action = runtime.cycle_grid_policy,
     },
     {
       kind = "action",
@@ -52,14 +53,16 @@ local function build_rows()
         return string.lower(status.arc_policy)
       end,
       action = runtime.cycle_arc_policy,
+      enc_action = runtime.cycle_arc_policy,
     },
     {
       kind = "action",
-      name = "scrub",
+      name = "retry writes",
       value = function()
-        return status.scrub_enabled and "on" or "off"
+        return status.retry_writes_enabled and "on" or "off"
       end,
-      action = runtime.toggle_scrub,
+      action = runtime.toggle_retry_writes,
+      enc_action = runtime.toggle_retry_writes,
     },
     {
       kind = "info",
@@ -106,18 +109,18 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "section",
-    name = "recent",
+    name = "saved",
   })
 
-  if #status.recent_clients == 0 then
+  if #status.saved_clients == 0 then
     table.insert(rows, {
       kind = "detail",
       text = function()
-        return "no recent clients"
+        return "no saved clients"
       end,
     })
   else
-    for _, client in ipairs(status.recent_clients) do
+    for _, client in ipairs(status.saved_clients) do
       local label = runtime.describe_client(client)
       table.insert(rows, {
         kind = "detail",
@@ -146,11 +149,11 @@ local function build_rows()
 
   table.insert(rows, {
     kind = "action",
-    name = "forget saved",
+    name = "disconnect all",
     value = function()
       return ""
     end,
-    action = runtime.forget_client_history,
+    action = runtime.disconnect_all_clients,
   })
 
   table.insert(rows, {
@@ -266,13 +269,27 @@ function menu.key(n, z)
 end
 
 function menu.enc(n, d)
-  if n ~= 2 or d == 0 then
+  if d == 0 then
     return
   end
 
-  local rows = current_rows()
-  menu.index = util.clamp(menu.index + (d > 0 and 1 or -1), 1, math.max(1, #rows))
-  menu.redraw()
+  if n == 2 then
+    local rows = current_rows()
+    menu.index = util.clamp(menu.index + (d > 0 and 1 or -1), 1, math.max(1, #rows))
+    menu.redraw()
+    return
+  end
+
+  if n == 3 then
+    local row = selected_row()
+    if row and row.enc_action then
+      local step = d > 0 and 1 or -1
+      for _ = 1, math.abs(d) do
+        row.enc_action(step)
+      end
+      menu.redraw()
+    end
+  end
 end
 
 runtime.set_menu_redraw(function()

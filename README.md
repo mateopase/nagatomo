@@ -41,7 +41,7 @@ After that, start the layout in TouchOSC. The mod will register a client as soon
 - installs global `grid` and `arc` wrappers when the mod loads
 - routes TouchOSC OSC centrally instead of patching grid and arc separately
 - mirrors script LED state back to TouchOSC
-- reasserts recently written LEDs on `refresh()` to help recover from dropped UDP packets
+- can retry newly written LEDs once on `refresh()` to help recover from dropped UDP packets
 - supports physical devices, TouchOSC-only mode, or both at once
 - adds a mod page for status and recovery actions
 
@@ -53,18 +53,18 @@ The `nagatomo` page in `system > mods` shows:
 
 - grid policy
 - arc policy
-- scrub (periodic refreshes) on/off
+- retry writes on/off
 - whether the current script has grid and arc callbacks bound
 - active clients
-- recently seen clients
+- saved clients
 
 Available actions:
 
 - `resend state`: pushes the current grid and arc LED state to active clients again
-- `forget saved`: clears remembered client history
+- `disconnect all`: marks all active clients inactive for the current boot session
 - `light test`: sends a test pattern to TouchOSC and any mirrored hardware
 
-The scrub toggle controls whether `nagatomo` reasserts recently written LEDs on later `refresh()` calls. It is on by default.
+The `retry writes` toggle controls whether `nagatomo` sends newly written LEDs one extra time on the next `refresh()`. It is off by default.
 
 ## policies
 

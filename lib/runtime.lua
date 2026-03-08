@@ -15,7 +15,6 @@ local runtime = {
   data_dir = tostring(_path.data) .. MOD_NAME .. "/",
   prefs_fn = tostring(_path.data) .. MOD_NAME .. "/prefs.lua",
   clients_fn = tostring(_path.data) .. MOD_NAME .. "/clients.lua",
-  client_timeout_s = 20,
 }
 
 local GRID_PORTS = 4
@@ -24,7 +23,6 @@ local GRID_ROWS = 8
 local ARC_PORTS = 4
 local ARC_COLS = 4
 local ARC_ROWS = 64
-local HOT_WINDOW_S = 0.75
 local SENT_UNKNOWN = -1
 
 local POLICY_ORDER = { "auto", "touchosc", "mirror" }
@@ -51,7 +49,7 @@ local core = {
 runtime.prefs = {
   grid_policy = "auto",
   arc_policy = "auto",
-  scrub_enabled = true,
+  retry_writes_enabled = false,
 }
 runtime.clients = {}
 runtime.client_order = {}
@@ -86,12 +84,12 @@ end
 
 runtime.grid_state = {
   current = create_buffer(GRID_COLS, GRID_ROWS, 0),
-  hot_until = create_buffer(GRID_COLS, GRID_ROWS, 0),
+  retry_pending = create_buffer(GRID_COLS, GRID_ROWS, false),
 }
 
 runtime.arc_state = {
   current = create_buffer(ARC_COLS, ARC_ROWS, 0),
-  hot_until = create_buffer(ARC_COLS, ARC_ROWS, 0),
+  retry_pending = create_buffer(ARC_COLS, ARC_ROWS, false),
 }
 
 local function ensure_dir(path)
@@ -132,86 +130,28 @@ local function reset_client_transient(client)
   end
 end
 
-local function make_client(host, port, first_seen, last_seen, active, capabilities)
+local function make_client(host, port, last_seen, active)
   local key = client_key(host, port)
   local client = {
     key = key,
     host = host,
     port = port,
-    first_seen = tonumber(first_seen) or now_s(),
     last_seen = tonumber(last_seen) or 0,
     active = active == true,
-    capabilities = capabilities or {},
   }
   reset_client_transient(client)
   return client
-end
-
-local function has_capability(client, name)
-  return client.capabilities[name] == true
-end
-
-local function add_capability(client, name)
-  if not has_capability(client, name) then
-    client.capabilities[name] = true
-    return true
-  end
-  return false
-end
-
-local function encode_capabilities(capabilities)
-  local encoded = {}
-  for name, enabled in pairs(capabilities or {}) do
-    if enabled then
-      table.insert(encoded, name)
-    end
-  end
-  table.sort(encoded)
-  return encoded
-end
-
-local function decode_capabilities(encoded)
-  local capabilities = {}
-  for _, name in ipairs(encoded or {}) do
-    capabilities[name] = true
-  end
-  return capabilities
 end
 
 local function client_is_active(client)
   return client ~= nil and client.active == true
 end
 
-local function client_is_fresh(client)
-  if not client or not client.active then
-    return false
-  end
-  return (now_s() - (client.last_seen or 0)) <= runtime.client_timeout_s
-end
-
-local function sweep_inactive_clients()
-  local changed = false
-  for _, key in ipairs(runtime.client_order) do
-    local client = runtime.clients[key]
-    if client and client.active and not client_is_fresh(client) then
-      client.active = false
-      reset_client_transient(client)
-      print(string.format("[nagatomo] client timed out: %s:%s", client.host, tostring(client.port)))
-      changed = true
-    end
-  end
-  if changed then
-    mark_dirty()
-  end
-end
-
 local function snapshot_client(client)
   return {
     host = client.host,
     port = client.port,
-    first_seen = client.first_seen,
     last_seen = client.last_seen,
-    capabilities = encode_capabilities(client.capabilities),
   }
 end
 
@@ -245,10 +185,8 @@ local function load_clients()
       local client = make_client(
         entry.host,
         entry.port,
-        entry.first_seen,
         entry.last_seen,
-        false,
-        decode_capabilities(entry.capabilities)
+        false
       )
       runtime.clients[client.key] = client
       table.insert(runtime.client_order, client.key)
@@ -261,7 +199,7 @@ local function save_prefs()
   tabutil.save({
     grid_policy = runtime.prefs.grid_policy,
     arc_policy = runtime.prefs.arc_policy,
-    scrub_enabled = runtime.prefs.scrub_enabled,
+    retry_writes_enabled = runtime.prefs.retry_writes_enabled,
   }, runtime.prefs_fn)
 end
 
@@ -282,8 +220,10 @@ local function load_prefs()
   if POLICY_LABELS[saved.arc_policy] then
     runtime.prefs.arc_policy = saved.arc_policy
   end
-  if type(saved.scrub_enabled) == "boolean" then
-    runtime.prefs.scrub_enabled = saved.scrub_enabled
+  if type(saved.retry_writes_enabled) == "boolean" then
+    runtime.prefs.retry_writes_enabled = saved.retry_writes_enabled
+  elseif type(saved.scrub_enabled) == "boolean" then
+    runtime.prefs.retry_writes_enabled = saved.scrub_enabled
   end
 end
 
@@ -312,7 +252,6 @@ local function arc_has_physical(port)
 end
 
 local function active_client_count()
-  sweep_inactive_clients()
   local count = 0
   for _, client in pairs(runtime.clients) do
     if client_is_active(client) then
@@ -320,6 +259,22 @@ local function active_client_count()
     end
   end
   return count
+end
+
+local function clear_grid_retry_pending()
+  for y = 1, GRID_ROWS do
+    for x = 1, GRID_COLS do
+      runtime.grid_state.retry_pending[x][y] = false
+    end
+  end
+end
+
+local function clear_arc_retry_pending()
+  for ring = 1, ARC_COLS do
+    for led = 1, ARC_ROWS do
+      runtime.arc_state.retry_pending[ring][led] = false
+    end
+  end
 end
 
 grid_touchosc_enabled = function(port)
@@ -358,25 +313,17 @@ local function arc_physical_enabled(port)
   return arc_has_physical(port)
 end
 
-local function grid_virtual_available(port)
-  return port == 1
-end
-
-local function arc_virtual_available(port)
-  return port == 1
-end
-
 local function grid_port_mode(port)
   if port ~= 1 then
     return grid_has_physical(port) and "physical" or "none"
   end
   if runtime.prefs.grid_policy == "touchosc" then
-    return grid_virtual_available(port) and "virtual" or "none"
+    return "virtual"
   end
   if grid_has_physical(port) then
     return "physical"
   end
-  return grid_virtual_available(port) and "virtual" or "none"
+  return "virtual"
 end
 
 local function arc_port_mode(port)
@@ -384,12 +331,12 @@ local function arc_port_mode(port)
     return arc_has_physical(port) and "physical" or "none"
   end
   if runtime.prefs.arc_policy == "touchosc" then
-    return arc_virtual_available(port) and "virtual" or "none"
+    return "virtual"
   end
   if arc_has_physical(port) then
     return "physical"
   end
-  return arc_virtual_available(port) and "virtual" or "none"
+  return "virtual"
 end
 
 local function current_grid_device(port)
@@ -496,20 +443,18 @@ local function list_clients(filter)
 end
 
 function runtime.active_clients()
-  sweep_inactive_clients()
   return list_clients(function(client)
     return client_is_active(client)
   end)
 end
 
-function runtime.recent_clients()
-  sweep_inactive_clients()
+function runtime.saved_clients()
   return list_clients(function(client)
     return not client_is_active(client)
   end)
 end
 
-local function ensure_client(from, capability)
+local function ensure_client(from)
   local host, port = normalize_from(from)
   local key = client_key(host, port)
   local client = runtime.clients[key]
@@ -518,7 +463,7 @@ local function ensure_client(from, capability)
 
   if client == nil then
     created = true
-    client = make_client(host, port, now_s(), now_s(), true, {})
+    client = make_client(host, port, now_s(), true)
     runtime.clients[key] = client
     table.insert(runtime.client_order, key)
   else
@@ -530,12 +475,7 @@ local function ensure_client(from, capability)
     end
   end
 
-  local capability_changed = false
-  if capability then
-    capability_changed = add_capability(client, capability)
-  end
-
-  if created or capability_changed then
+  if created then
     save_clients()
   end
 
@@ -562,20 +502,18 @@ local function send_arc_led(client, ring, led, level)
   end
 end
 
-local function send_grid_state(force, target_client, hot_only)
-  sweep_inactive_clients()
+local function send_grid_state(force, target_client, retry_only)
   if not grid_touchosc_enabled(1) then
     return
   end
 
-  local now = now_s()
   local clients = target_client and { target_client } or runtime.active_clients()
   for _, client in ipairs(clients) do
     for y = 1, GRID_ROWS do
       for x = 1, GRID_COLS do
         local current = runtime.grid_state.current[x][y]
-        local is_hot = runtime.grid_state.hot_until[x][y] > now
-        if force or (hot_only and is_hot) or (not hot_only and client.grid_sent[x][y] ~= current) then
+        local pending_retry = runtime.grid_state.retry_pending[x][y] == true
+        if force or (retry_only and pending_retry) or (not retry_only and client.grid_sent[x][y] ~= current) then
           send_grid_led(client, x, y, current)
           client.grid_sent[x][y] = current
         end
@@ -584,20 +522,18 @@ local function send_grid_state(force, target_client, hot_only)
   end
 end
 
-local function send_arc_state(force, target_client, hot_only)
-  sweep_inactive_clients()
+local function send_arc_state(force, target_client, retry_only)
   if not arc_touchosc_enabled(1) then
     return
   end
 
-  local now = now_s()
   local clients = target_client and { target_client } or runtime.active_clients()
   for _, client in ipairs(clients) do
     for ring = 1, ARC_COLS do
       for led = 1, ARC_ROWS do
         local current = runtime.arc_state.current[ring][led]
-        local is_hot = runtime.arc_state.hot_until[ring][led] > now
-        if force or (hot_only and is_hot) or (not hot_only and client.arc_sent[ring][led] ~= current) then
+        local pending_retry = runtime.arc_state.retry_pending[ring][led] == true
+        if force or (retry_only and pending_retry) or (not retry_only and client.arc_sent[ring][led] ~= current) then
           send_arc_led(client, ring, led, current)
           client.arc_sent[ring][led] = current
         end
@@ -607,7 +543,6 @@ local function send_arc_state(force, target_client, hot_only)
 end
 
 function runtime.resend_state(target_client, include_connected)
-  sweep_inactive_clients()
   local clients = target_client and { target_client } or runtime.active_clients()
   for _, client in ipairs(clients) do
     if include_connected ~= false then
@@ -638,19 +573,19 @@ local function age_string(timestamp)
 end
 
 function runtime.describe_client(client)
-  local state = client_is_active(client) and "active" or "recent"
+  local state = client_is_active(client) and "active" or "saved"
   return string.format("%s:%s %s %s", client.host, tostring(client.port), state, age_string(client.last_seen))
 end
 
 function runtime.status()
   local active_clients = runtime.active_clients()
-  local recent_clients = runtime.recent_clients()
+  local saved_clients = runtime.saved_clients()
   return {
     grid_policy = POLICY_LABELS[runtime.prefs.grid_policy],
     arc_policy = POLICY_LABELS[runtime.prefs.arc_policy],
-    scrub_enabled = runtime.prefs.scrub_enabled,
+    retry_writes_enabled = runtime.prefs.retry_writes_enabled,
     active_clients = active_clients,
-    recent_clients = recent_clients,
+    saved_clients = saved_clients,
     grid_bound = runtime.grid_vports[1].key ~= nil or runtime.grid_vports[1].tilt ~= nil,
     arc_bound = runtime.arc_vports[1].key ~= nil or runtime.arc_vports[1].delta ~= nil,
     script_name = norns.state.name,
@@ -658,7 +593,7 @@ function runtime.status()
   }
 end
 
-local function cycle_policy(kind)
+local function cycle_policy(kind, direction)
   local current = runtime.prefs[kind]
   local index = 1
   for i, name in ipairs(POLICY_ORDER) do
@@ -667,7 +602,11 @@ local function cycle_policy(kind)
       break
     end
   end
-  index = (index % #POLICY_ORDER) + 1
+  if direction and direction < 0 then
+    index = ((index - 2 + #POLICY_ORDER) % #POLICY_ORDER) + 1
+  else
+    index = (index % #POLICY_ORDER) + 1
+  end
   runtime.prefs[kind] = POLICY_ORDER[index]
   save_prefs()
   runtime.refresh_ports()
@@ -675,26 +614,36 @@ local function cycle_policy(kind)
   print(string.format("[nagatomo] %s policy -> %s", kind, POLICY_LABELS[runtime.prefs[kind]]))
 end
 
-function runtime.cycle_grid_policy()
-  cycle_policy("grid_policy")
+function runtime.cycle_grid_policy(direction)
+  cycle_policy("grid_policy", direction)
 end
 
-function runtime.cycle_arc_policy()
-  cycle_policy("arc_policy")
+function runtime.cycle_arc_policy(direction)
+  cycle_policy("arc_policy", direction)
 end
 
-function runtime.toggle_scrub()
-  runtime.prefs.scrub_enabled = not runtime.prefs.scrub_enabled
+function runtime.toggle_retry_writes()
+  runtime.prefs.retry_writes_enabled = not runtime.prefs.retry_writes_enabled
+  if not runtime.prefs.retry_writes_enabled then
+    clear_grid_retry_pending()
+    clear_arc_retry_pending()
+  end
   save_prefs()
-  print(string.format("[nagatomo] scrub -> %s", runtime.prefs.scrub_enabled and "on" or "off"))
+  print(string.format("[nagatomo] retry writes -> %s", runtime.prefs.retry_writes_enabled and "on" or "off"))
   mark_dirty()
 end
 
-function runtime.forget_client_history()
-  runtime.clients = {}
-  runtime.client_order = {}
-  save_clients()
-  print("[nagatomo] forgot client history")
+function runtime.disconnect_all_clients()
+  for _, client in pairs(runtime.clients) do
+    if client.active then
+      send_connected(client, false)
+      client.active = false
+      reset_client_transient(client)
+    end
+  end
+  clear_grid_retry_pending()
+  clear_arc_retry_pending()
+  print("[nagatomo] disconnected all active clients")
   mark_dirty()
 end
 
@@ -702,7 +651,7 @@ local function reset_grid_state(level)
   for y = 1, GRID_ROWS do
     for x = 1, GRID_COLS do
       runtime.grid_state.current[x][y] = level
-      runtime.grid_state.hot_until[x][y] = 0
+      runtime.grid_state.retry_pending[x][y] = false
     end
   end
 end
@@ -711,7 +660,7 @@ local function reset_arc_state(level)
   for ring = 1, ARC_COLS do
     for led = 1, ARC_ROWS do
       runtime.arc_state.current[ring][led] = level
-      runtime.arc_state.hot_until[ring][led] = 0
+      runtime.arc_state.retry_pending[ring][led] = false
     end
   end
 end
@@ -723,33 +672,33 @@ local function apply_level(current, level, rel)
   return util.clamp(level, 0, 15)
 end
 
-local function set_grid_current(x, y, level, hot_until, mark_hot_when_unchanged)
+local function set_grid_current(x, y, level, mark_retry)
   if x < 1 or x > GRID_COLS or y < 1 or y > GRID_ROWS then
     return false
   end
   if runtime.grid_state.current[x][y] == level then
-    if mark_hot_when_unchanged then
-      runtime.grid_state.hot_until[x][y] = hot_until or (now_s() + HOT_WINDOW_S)
+    if mark_retry then
+      runtime.grid_state.retry_pending[x][y] = true
     end
     return false
   end
   runtime.grid_state.current[x][y] = level
-  runtime.grid_state.hot_until[x][y] = hot_until or (now_s() + HOT_WINDOW_S)
+  runtime.grid_state.retry_pending[x][y] = mark_retry == true
   return true
 end
 
-local function set_arc_current(ring, led, level, hot_until, mark_hot_when_unchanged)
+local function set_arc_current(ring, led, level, mark_retry)
   if ring < 1 or ring > ARC_COLS or led < 1 or led > ARC_ROWS then
     return false
   end
   if runtime.arc_state.current[ring][led] == level then
-    if mark_hot_when_unchanged then
-      runtime.arc_state.hot_until[ring][led] = hot_until or (now_s() + HOT_WINDOW_S)
+    if mark_retry then
+      runtime.arc_state.retry_pending[ring][led] = true
     end
     return false
   end
   runtime.arc_state.current[ring][led] = level
-  runtime.arc_state.hot_until[ring][led] = hot_until or (now_s() + HOT_WINDOW_S)
+  runtime.arc_state.retry_pending[ring][led] = mark_retry == true
   return true
 end
 
@@ -759,7 +708,7 @@ function runtime.grid_led(port, x, y, level, rel)
     local current = runtime.grid_state.current[x] and runtime.grid_state.current[x][y]
     if current ~= nil then
       local next_level = apply_level(current, level, rel)
-      set_grid_current(x, y, next_level, nil, runtime.prefs.scrub_enabled)
+      set_grid_current(x, y, next_level, runtime.prefs.retry_writes_enabled)
     end
   end
   if grid_physical_enabled(port) then
@@ -770,11 +719,10 @@ end
 function runtime.grid_all(port, level, rel)
   level = math.floor(level or 0)
   if port == 1 then
-    local hot_until = now_s() + HOT_WINDOW_S
     for y = 1, GRID_ROWS do
       for x = 1, GRID_COLS do
         local next_level = apply_level(runtime.grid_state.current[x][y], level, rel)
-        set_grid_current(x, y, next_level, hot_until, runtime.prefs.scrub_enabled)
+        set_grid_current(x, y, next_level, runtime.prefs.retry_writes_enabled)
       end
     end
   end
@@ -786,8 +734,11 @@ end
 function runtime.grid_refresh(port, force)
   if port == 1 then
     send_grid_state(force == true)
-    if force ~= true and runtime.prefs.scrub_enabled then
+    if force == true then
+      clear_grid_retry_pending()
+    elseif runtime.prefs.retry_writes_enabled then
       send_grid_state(false, nil, true)
+      clear_grid_retry_pending()
     end
   end
   if grid_physical_enabled(port) then
@@ -819,7 +770,7 @@ function runtime.arc_led(port, ring, led, level, rel)
     local current = runtime.arc_state.current[ring] and runtime.arc_state.current[ring][led]
     if current ~= nil then
       local next_level = apply_level(current, level, rel)
-      set_arc_current(ring, led, next_level, nil, runtime.prefs.scrub_enabled)
+      set_arc_current(ring, led, next_level, runtime.prefs.retry_writes_enabled)
     end
   end
   if arc_physical_enabled(port) then
@@ -830,11 +781,10 @@ end
 function runtime.arc_all(port, level, rel)
   level = math.floor(level or 0)
   if port == 1 then
-    local hot_until = now_s() + HOT_WINDOW_S
     for ring = 1, ARC_COLS do
       for led = 1, ARC_ROWS do
         local next_level = apply_level(runtime.arc_state.current[ring][led], level, rel)
-        set_arc_current(ring, led, next_level, hot_until, runtime.prefs.scrub_enabled)
+        set_arc_current(ring, led, next_level, runtime.prefs.retry_writes_enabled)
       end
     end
   end
@@ -864,7 +814,6 @@ function runtime.arc_segment(port, ring, from_angle, to_angle, level, rel)
   end
 
   local step = tau / ARC_ROWS
-  local hot_until = now_s() + HOT_WINDOW_S
   level = math.floor(level or 0)
   for led = 1, ARC_ROWS do
     local sa = step * (led - 1)
@@ -875,7 +824,7 @@ function runtime.arc_segment(port, ring, from_angle, to_angle, level, rel)
       local current = runtime.arc_state.current[ring] and runtime.arc_state.current[ring][led]
       if current ~= nil then
         local next_level = apply_level(current, brightness, rel)
-        set_arc_current(ring, led, next_level, hot_until, runtime.prefs.scrub_enabled)
+        set_arc_current(ring, led, next_level, runtime.prefs.retry_writes_enabled)
       end
     end
     if arc_physical_enabled(port) then
@@ -887,8 +836,11 @@ end
 function runtime.arc_refresh(port, force)
   if port == 1 then
     send_arc_state(force == true)
-    if force ~= true and runtime.prefs.scrub_enabled then
+    if force == true then
+      clear_arc_retry_pending()
+    elseif runtime.prefs.retry_writes_enabled then
       send_arc_state(false, nil, true)
+      clear_arc_retry_pending()
     end
   end
   if arc_physical_enabled(port) then
@@ -1045,7 +997,7 @@ local function handle_connection(args, from)
     return true
   end
 
-  local client = ensure_client(from, "connection")
+  local client = ensure_client(from)
   client.active = true
   client.last_seen = now_s()
   send_connected(client, true)
@@ -1069,7 +1021,7 @@ local function handle_touchosc(path, args, from)
     if x == nil then
       return false
     end
-    local client, created, reactivated = ensure_client(from, "grid")
+    local client, created, reactivated = ensure_client(from)
     if created or reactivated then
       send_connected(client, true)
       send_grid_state(true, client)
@@ -1083,7 +1035,7 @@ local function handle_touchosc(path, args, from)
     if ring == nil then
       return false
     end
-    local client, created, reactivated = ensure_client(from, "arc")
+    local client, created, reactivated = ensure_client(from)
     if created or reactivated then
       send_connected(client, true)
       send_grid_state(true, client)
@@ -1189,7 +1141,6 @@ function runtime.set_menu_redraw(func)
 end
 
 function runtime.run_light_test()
-  sweep_inactive_clients()
   local clients = runtime.active_clients()
 
   for _, client in ipairs(clients) do
