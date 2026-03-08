@@ -108,9 +108,6 @@ return function(runtime, ctx)
       return false
     end
     if runtime.grid_state.current[index] == level then
-      if mark_retry then
-        mark_grid_retry(index)
-      end
       return false
     end
     runtime.grid_state.current[index] = level
@@ -126,9 +123,6 @@ return function(runtime, ctx)
       return false
     end
     if runtime.arc_state.current[index] == level then
-      if mark_retry then
-        mark_arc_retry(index)
-      end
       return false
     end
     runtime.arc_state.current[index] = level

@@ -64,7 +64,7 @@ Available actions:
 - `disconnect all`: marks all active clients inactive for the current boot session
 - `light test`: sends a test pattern to TouchOSC and any mirrored hardware
 
-The `retry writes` toggle controls whether `nagatomo` sends newly written LEDs one extra time on the next `refresh()`. It is off by default.
+The `retry writes` toggle controls whether `nagatomo` sends changed LEDs one extra time on the next `refresh()`. It is off by default.
 
 ## policies
 
